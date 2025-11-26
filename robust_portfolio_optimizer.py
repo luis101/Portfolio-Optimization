@@ -1,3 +1,4 @@
+
 """
 Robust Portfolio Optimization Suite
 Implements multiple approaches to robust portfolio optimization including:
@@ -7,133 +8,126 @@ Implements multiple approaches to robust portfolio optimization including:
 4. Resampling methods
 5. Robust covariance estimation (Ledoit-Wolf and Factor Models)
 6. Distributional robustness with Wasserstein distance
-7. Regularization with Elastic Net
+7. Regularization with L1, L2, or as Elastic Net
 """
 
 import numpy as np
 import pandas as pd
+import cvxpy as cp
+import yfinance as yf
 from scipy.optimize import minimize
 from scipy.stats import norm
+import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
 class PortfolioOptimizer:
     """
-    A comprehensive portfolio optimization class with multiple robust methods.
+    A comprehensive portfolio optimization class with multiple robust methods
     """
     
-    def __init__(self, returns_data):
+    def __init__(self, returns_data, risk_free_rate=0.0):
         """
-        Initialize with historical returns data.
+        Initialize the optimizer with historical returns data
         
         Parameters:
         -----------
         returns_data : pd.DataFrame or np.ndarray
             Historical returns (T x N) where T is time periods and N is assets
+        risk_free_rate : float
+            Risk-free rate for Sharpe ratio calculations
         """
-        if isinstance(returns_data, pd.DataFrame):
-            self.returns = returns_data.values
-            self.asset_names = returns_data.columns.tolist()
-        else:
-            self.returns = returns_data
-            self.asset_names = [f"Asset_{i}" for i in range(returns_data.shape[1])]
+
+        self.returns = returns_data.values
+        self.asset_names = returns_data.columns.tolist()
+        self.assets = returns_data.columns
         
         self.n_assets = self.returns.shape[1]
         self.n_periods = self.returns.shape[0]
+        self.rf = risk_free_rate
         
         # Calculate basic statistics
         self.mu = np.mean(self.returns, axis=0)
         self.cov = np.cov(self.returns.T)
         
     def _portfolio_performance(self, weights, mu, cov):
-        """Calculate portfolio return and volatility."""
+        """Calculate portfolio return and volatility"""
+
         ret = np.dot(weights, mu)
         vol = np.sqrt(np.dot(weights, np.dot(cov, weights)))
         return ret, vol
     
-    def _neg_sharpe(self, weights, mu, cov, risk_free_rate=0.0):
-        """Negative Sharpe ratio for minimization."""
+    def _neg_sharpe(self, weights, mu, cov):
+        """Negative Sharpe ratio for minimization"""
+
         ret, vol = self._portfolio_performance(weights, mu, cov)
-        return -(ret - risk_free_rate) / vol
+        sharpe = (ret - self.rf) / vol
+        return -sharpe
     
-    # ========================================================================
     # 1. CLASSICAL MARKOWITZ OPTIMIZATION
-    # ========================================================================
     
-    def markowitz_optimization(self, target_return=None, risk_free_rate=0.0):
+    def mean_variance_optimization(self, target_return=None, risk_aversion=1.0):
         """
-        Classical mean-variance optimization.
+        Classical Markowitz mean-variance optimization
         
-        Parameters:
-        -----------
-        target_return : float, optional
-            Target portfolio return. If None, maximizes Sharpe ratio.
-        risk_free_rate : float
-            Risk-free rate for Sharpe ratio calculation
-            
         Returns:
-        --------
-        dict : Optimization results including weights and performance
+        # dict : Optimization results including weights and performance
         """
-        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+        # constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}] # Sum of weights = 1
+        # bounds = tuple((0, 1) for _ in range(self.n_assets)) # No short selling
+        # init_weights = np.ones(self.n_assets) / self.n_assets # Equal weights
+        
+        # Maximize Sharpe ratio
+        # result = minimize(self._neg_sharpe, init_weights, args=(self.mu, self.cov), 
+        #                  method='SLSQP', bounds=bounds, constraints=constraints)
+        
+        #weights = result.x
+        #ret, vol = self._portfolio_performance(weights, self.mu, self.cov)
+        
+        # return {'weights': weights, 'return': ret, 'volatility': vol, 
+        #        'sharpe': (ret - self.rf) / vol, 'method': 'Markowitz'}
+        
+        # Using cvxpy for quadratic programming
+        w = cp.Variable(self.n_assets)
         
         if target_return is not None:
-            constraints.append({
-                'type': 'eq',
-                'fun': lambda w: np.dot(w, self.mu) - target_return
-            })
-        
-        bounds = tuple((0, 1) for _ in range(self.n_assets))
-        init_weights = np.ones(self.n_assets) / self.n_assets
-        
-        if target_return is None:
-            # Maximize Sharpe ratio
-            result = minimize(
-                self._neg_sharpe,
-                init_weights,
-                args=(self.mu, self.cov, risk_free_rate),
-                method='SLSQP',
-                bounds=bounds,
-                constraints=constraints
-            )
+            constraints = [
+                cp.sum(w) == 1,
+                w >= 0,
+                w <= 1,
+                w.T @ self.mu >= target_return
+            ]
+            objective = cp.Minimize(cp.quad_form(w, self.cov))
         else:
-            # Minimize variance for target return
-            result = minimize(
-                lambda w: np.dot(w, np.dot(self.cov, w)),
-                init_weights,
-                method='SLSQP',
-                bounds=bounds,
-                constraints=constraints
-            )
+            constraints = [
+                cp.sum(w) == 1,
+                w >= 0,
+                w <= 1
+            ]
+            objective = cp.Minimize(-w.T @ self.mu + risk_aversion * cp.quad_form(w, self.cov))
         
-        weights = result.x
-        ret, vol = self._portfolio_performance(weights, self.mu, self.cov)
+        prob = cp.Problem(objective, constraints)
+        prob.solve()
+
+        weights = w.value if prob.status == 'optimal' else None
+
+        # ret, vol = self._portfolio_performance(weights, self.mu, self.cov)
+        # return {'weights': weights, 'return': ret, 'volatility': vol, 
+        #        'sharpe': (ret - self.rf) / vol, 'method': 'Markowitz'}
         
-        return {
-            'weights': weights,
-            'return': ret,
-            'volatility': vol,
-            'sharpe': (ret - risk_free_rate) / vol,
-            'method': 'Markowitz'
-        }
+        return weights
     
-    # ========================================================================
     # 2. WORST-CASE OPTIMIZATION WITH ELLIPSOIDAL UNCERTAINTY
-    # ========================================================================
-    
-    def worst_case_optimization(self, kappa=2, risk_free_rate=0.00):
+
+    def ellipsoidal_uncertainty(self, kappa=2):
         """
         Robust optimization with ellipsoidal uncertainty set for expected returns.
         
         Parameters:
-        -----------
         kappa : float
             Size of uncertainty set (higher = more conservative)
-        risk_free_rate : float
-            Risk-free rate
-            
+    
         Returns:
-        --------
         dict : Optimization results
         """
         # Standard error of mean estimates
@@ -151,11 +145,11 @@ class PortfolioOptimizer:
             worst_case_return = nominal_return - uncertainty_penalty
             
             # Negative Sharpe for minimization
-            return -(worst_case_return - risk_free_rate) / (portfolio_vol + 1e-8)
+            return -(worst_case_return - self.rf) / (portfolio_vol + 1e-8)
         
-        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
-        bounds = tuple((0, 1) for _ in range(self.n_assets))
-        init_weights = np.ones(self.n_assets) / self.n_assets
+        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}] # Sum of weights = 1
+        bounds = tuple((0, 1) for _ in range(self.n_assets)) # No short selling
+        init_weights = np.ones(self.n_assets) / self.n_assets # Equal weights
         
         result = minimize(
             robust_objective,
@@ -172,8 +166,8 @@ class PortfolioOptimizer:
             'weights': weights,
             'return': ret,
             'volatility': vol,
-            'sharpe': (ret - risk_free_rate) / vol,
-            'method': 'Worst-Case (Ellipsoidal)'
+            'sharpe': (ret - self.rf) / vol,
+            'method': 'Ellipsoidal Uncertainty Set'
         }
     
     # ========================================================================
