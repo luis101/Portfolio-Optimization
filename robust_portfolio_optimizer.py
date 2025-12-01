@@ -39,10 +39,15 @@ class PortfolioOptimizer:
             Risk-free rate for Sharpe ratio calculations
         """
 
-        self.returns = returns_data.values
-        self.asset_names = returns_data.columns.tolist()
-        self.assets = returns_data.columns
-        
+        if isinstance(returns_data, pd.DataFrame):
+              self.returns = returns_data
+              self.asset_names = returns_data.columns.tolist()
+              self.assets = returns_data.columns
+        else:
+              self.returns = pd.DataFrame(returns_data)
+              self.asset_names = [f'Asset {i+1}' for i in range(returns_data.shape[1])]
+              self.assets = self.returns.columns
+
         self.n_assets = self.returns.shape[1]
         self.n_periods = self.returns.shape[0]
         self.rf = risk_free_rate
@@ -57,7 +62,7 @@ class PortfolioOptimizer:
             return None
             
         portfolio_return = self.mu @ weights
-        portfolio_volatility = np.sqrt(weights.T @ self.Sigma @ weights)
+        portfolio_volatility = np.sqrt(weights.T @ self.cov @ weights)
         sharpe_ratio = portfolio_return / portfolio_volatility if portfolio_volatility > 0 else 0
         
         return {
@@ -81,26 +86,26 @@ class PortfolioOptimizer:
         sharpe = (ret - self.rf) / vol
         return -sharpe
     
-    def _solve_mean_variance_sample(self, mu, sigma, target_return):
+    def _solve_mean_variance_sample(self, mu, cov, target_return, risk_aversion=1.0):
         """Helper function for mean-variance optimization"""
         w = cp.Variable(self.n_assets)
         if target_return is not None:
             constraints = [cp.sum(w) == 1, w >= 0, w <= 1, w.T @ mu >= target_return]
-            objective = cp.Minimize(cp.quad_form(w, sigma))
+            objective = cp.Minimize(cp.quad_form(w, cov))
         else:
             constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-            objective = cp.Minimize(-w.T @ self.mu + risk_aversion * cp.quad_form(w, sigma))
+            objective = cp.Minimize(-w.T @ self.mu + risk_aversion * cp.quad_form(w, cov))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
         
         return w.value if prob.status == 'optimal' else None
     
-    def _solve_min_variance_sample(self, sigma):
+    def _solve_min_variance_sample(self, cov):
         """Helper function for minimum variance optimization"""
         w = cp.Variable(self.n_assets)
         constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-        objective = cp.Minimize(cp.quad_form(w, sigma))
+        objective = cp.Minimize(cp.quad_form(w, cov))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -183,7 +188,7 @@ class PortfolioOptimizer:
     # 2. WORST-CASE OPTIMIZATION
     # ========================================================================
 
-    def wasserstein_optimization(self, epsilon=0.1, norm_type=2):
+    def wasserstein_optimization(self, epsilon=0.1, kappa=1.0, norm_type=2, risk_aversion=1.0):
         """
         Distributionally robust optimization using Wasserstein distance
         
@@ -202,23 +207,30 @@ class PortfolioOptimizer:
         # Portfolio return and variance
         portfolio_returns = w.T @ self.mu
         portfolio_var = cp.quad_form(w, self.cov)
-        portfolio_std = cp.sqrt(portfolio_var)
+        # portfolio_std = cp.sqrt(portfolio_var)
 
         # Worst-case adjustment (simplified Wasserstein penalty)
         # Based on: E[R] - epsilon * ||grad E[R]||
         if norm_type == 2:
-            wasserstein_penalty = epsilon * portfolio_std * np.sqrt(self.n_assets)
-            # wasserstein_penalty = epsilon * cp.norm(w, 2)
+            # wasserstein_penalty = epsilon * portfolio_var * np.sqrt(self.n_assets)
+            # wasserstein_penalty = epsilon * np.sqrt(self.n_assets / self.n_periods)
+            wasserstein_penalty = epsilon * cp.norm(w, 2)
         elif norm_type == 1:
             wasserstein_penalty = epsilon * cp.norm(w, 1)
         else:
             raise ValueError("Unsupported norm type")
-
+        
+        # robust_return = portfolio_returns - wasserstein_penalty * np.sqrt(portfolio_var)
         robust_return = portfolio_returns - wasserstein_penalty
 
+        # Worst-case variance (simplified conservative approximation)
+        worst_case_variance = portfolio_var + kappa * epsilon * cp.norm(w, 2)**2
+
         # Objective: maximize risk-adjusted return
-        objective = cp.Minimize(-(robust_return - self.rf) / portfolio_std)
-        # objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * cp.quad_form(w, self.cov))
+        # objective = cp.Minimize(-(robust_return - self.rf) / portfolio_var)
+        # objective = cp.Minimize(-(robust_return - self.rf) + (risk_aversion / 2) * portfolio_var)
+        # objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * cp.quad_form(w, self.cov))¨
+        objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * worst_case_variance)
 
         constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
 
@@ -292,7 +304,7 @@ class PortfolioOptimizer:
         w = cp.Variable(self.n_assets)
 
         # Uncertainty sets
-        mu_uncertainty = kappa_mu * cp.norm(cp.sqrtm(self.cov) @ w)
+        mu_uncertainty = kappa_mu * cp.norm(cp.sqrt(self.cov) @ w)
         sigma_uncertainty = kappa_sigma * cp.norm(w, 2) 
 
         # Worst-case expected return (min over ellipsoidal uncertainty)
@@ -434,15 +446,15 @@ class PortfolioOptimizer:
         for _ in range(n_samples):
             # Resample returns (bootstrap)
             indices = np.random.choice(self.n_periods, size=self.n_periods, replace=True)
-            sample_returns = self.returns[indices]
-            # sample_returns = self.returns.iloc[sample_idx]
+            sample_returns = self.returns.iloc[indices]
+            # sample_returns = self.returns[sample_idx]
             
             # Estimate parameters from resampled data
             mu_sample = np.mean(sample_returns, axis=0)
             cov_sample = np.cov(sample_returns.T)
             
             # Optimize for this sample
-            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+            # constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
             
             # if target_return is not None:
             #     constraints.append({'type': 'eq',
@@ -511,7 +523,7 @@ class PortfolioOptimizer:
         # result = minimize(self._neg_sharpe, init_weights, args=(self.mu, cov_lw, self.rf),
         #                   method='SLSQP', bounds=bounds, constraints=constraints)
 
-        weights = self._solve_mean_variance_sample(self.mu, cov_lw, target_return=None)
+        weights = self._solve_mean_variance_sample(self.mu, cov_lw, risk_aversion=risk_aversion, target_return=None)
         
         # weights = result.x
         # ret, vol = self._portfolio_performance(weights, self.mu, cov_lw)
@@ -542,6 +554,7 @@ class PortfolioOptimizer:
 
         # ---------- π ----------
         X = returns - np.mean(returns, axis=0) # Demeaned returns
+        X = X.values  # Convert to numpy array
         pi_hat = 0.0
         for t in range(T):
             x_t = X[t, :]
@@ -691,12 +704,12 @@ class PortfolioOptimizer:
         
         constraints = [
             cp.sum(w) == 1, w >= 0, w <= 1,
-            loss >= -self.returns @ w - VaR,
+            loss >= -self.returns.values @ w - VaR,
             loss >= 0
         ]
         
         CVaR = VaR + (1/(alpha * self.n_periods)) * cp.sum(loss)
-        expected_return = self.mu @ w
+        expected_return = self.mu.values @ w
         
         objective = cp.Minimize(-expected_return + risk_aversion * CVaR)
         
@@ -720,7 +733,7 @@ class PortfolioOptimizer:
         # CVaR constraints
         constraints = [
             cp.sum(w) == 1, w >= 0, w <= 1,
-            loss >= -self.returns @ w - VaR,
+            loss >= -self.returns.values @ w - VaR,
             loss >= 0
         ]
         
@@ -736,7 +749,7 @@ class PortfolioOptimizer:
             robustness_margin = epsilon * cp.sqrt(cp.quad_form(w, self.cov)) * np.sqrt(self.n_assets) / alpha
             
         robust_CVaR = CVaR + robustness_margin
-        expected_return = self.mu @ w - epsilon * cp.norm(w, 2)  # Worst-case return
+        expected_return = self.mu.values @ w - epsilon * cp.norm(w, 2)  # Worst-case return
         
         objective = cp.Minimize(-expected_return + risk_aversion * robust_CVaR)
         
@@ -751,7 +764,7 @@ class PortfolioOptimizer:
     # 7. ELASTIC NET REGULARIZATION
     # ========================================================================
     
-    def elastic_net_optimization(self, lambda_l1=0.01, lambda_l2=0.01):
+    def elastic_net_optimization(self, risk_aversion=2.0, lambda_l1=0.01, lambda_l2=0.01):
         """
         Portfolio optimization with Elastic Net regularization
         Combines L1 (sparsity) and L2 (diversification) penalties
@@ -762,27 +775,31 @@ class PortfolioOptimizer:
             L1 regularization parameter (encourages sparsity)
         lambda_l2 : float
             L2 regularization parameter (penalizes large positions)
-        risk_free_rate : float
-            Risk-free rate
         """
 
         w = cp.Variable(self.n_assets)
 
         # Portfolio return and risk 
-        portfolio_return = np.dot(w, self.mu) 
-        portfolio_var = np.dot(w, np.dot(self.cov, w)) 
+        portfolio_return = self.mu.values @ w
+        portfolio_var = cp.quad_form(w, self.cov)
         
         # Sharpe ratio component
-        sharpe_component = -(portfolio_return - self.rf) / np.sqrt(portfolio_var)
+        # sharpe_component = -(portfolio_return - self.rf) / np.sqrt(portfolio_var)
+
+        # Mean-variance utility (avoid sqrt for convexity)
+        # Using quadratic utility: return - (1/2) * risk_aversion * variance
+        utility = portfolio_return - (risk_aversion / 2) * portfolio_var
         
         # Elastic Net penalty: lambda1 * ||w||_1 + lambda2 * ||w||_2^2
-        l1_penalty = lambda_l1 * np.sum(np.abs(w))
-        #l2_penalty = lambda_l2 * np.sum(w**2)
+        # l1_penalty = lambda_l1 * w.sum()
+        l1_penalty = lambda_l1 * cp.norm1(w)
+        # l2_penalty = lambda_l2 * np.sum(w**2)
+        # l2_penalty = lambda_l2 * cp.sum_squares(w)
         l2_penalty = lambda_l2 * cp.norm(w, 2)**2
 
-        sharpe_penalized = sharpe_component + l1_penalty + l2_penalty
+        utility_penalized = -utility  + l1_penalty + l2_penalty
 
-        objective = cp.Minimize(sharpe_penalized)
+        objective = cp.Minimize(utility_penalized)
         constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
 
         prob = cp.Problem(objective, constraints)
@@ -827,9 +844,71 @@ class PortfolioOptimizer:
 
 # Download or generate returns data
 
-optimizer = PortfolioOptimizer(returns_df)
+# ticker = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'FB', 'TSLA', 'BRK-B', 'JPM', 'JNJ', 'V',
+#          'WMT', 'PG', 'UNH', 'DIS', 'NVDA', 'HD', 'MA', 'PYPL', 'BAC', 'VZ']
+ticker = ['^GSPC', '^IXIC', '^DJI', '^GDAXI', '^FTSE', '^FCHI', '^HSI', '^AXJO', 
+          '^BSESN', '^TWII', '^MXX', '^KS11', '^N225', '^BVSP', '^STI']
 
-def compare_all_methods():
+def download_fin_data(ticker, start_date = "1985-01-01",
+                      end_date = "2025-09-30"):
+    
+    asset_df = pd.DataFrame()
+    assets = pd.DataFrame()
+
+    # Define the stock symbol and loop over symbols
+
+    for symbol in ticker:
+        
+        # Download historical data
+        
+        print("Ticker: "+symbol)
+        
+        asset_data = yf.download(symbol, start=start_date, end=end_date)
+        asset_data = asset_data.stack(1)
+        asset_data = asset_data.reset_index(level=1)
+
+        asset_data['month_id'] = asset_data.index.strftime('%Y-%m')
+        asset_data['numst'] = asset_data.groupby(['month_id'])['Ticker'].transform('count')
+        asset_data = asset_data[(asset_data['numst']>=17)]
+
+        data_at = asset_data.groupby(['month_id']).last().reset_index()
+        asset_df = pd.concat([asset_df, data_at], axis=0)
+
+        # Load historical data
+
+        asset = yf.Ticker(symbol)
+        try:
+            data = asset.history(period="max")
+        except:
+            continue
+        
+        if len(data) == 0:
+            continue
+
+        data['Ticker'] = symbol
+
+        data['month_id'] = data.index.strftime('%Y-%m')
+        data[['Vol', 'Div']] = data.groupby(['month_id'])[['Volume', 'Dividends']].transform('sum')
+        data['numst'] = data.groupby(['month_id'])['Ticker'].transform('count')
+
+        sdf = data.groupby(['month_id']).last().reset_index()
+        # sdf["ret"] = ((sdf["Close"]+sdf['Div']) - sdf["Close"].shift(1)) / sdf["Close"].shift(1)
+        # sdf["ret"] = sdf["Close"].pct_change().fillna(0) + (sdf['Div'] / sdf["Close"].shift(1)).fillna(0)
+        sdf["ret"] = sdf["Close"].pct_change().fillna(0)
+        sdf = sdf[(sdf['numst']>=17)]
+
+        sdf = sdf[['month_id', 'Ticker', 'Close', 'Volume', 'Div', 'ret']]
+
+        assets = pd.concat([assets, sdf], axis=0)
+        
+        #del sdf
+        #gc.collect()
+
+    return assets, asset_df
+
+# Compare all methods
+
+def compare_all_methods(optimizer):
     """
     Run all optimization methods and compare results.
     
@@ -950,39 +1029,52 @@ def compare_all_methods():
     comparison_df = pd.DataFrame.from_dict(results, orient='index')
     comparison_df = comparison_df.reset_index().rename(columns={'index': 'Method'})
 
-    return comparison_df
+    return results, comparison_df
 
 
 # ======= EXAMPLE USAGE ======================================================
 
 if __name__ == "__main__":
+    
     # Generate synthetic returns data
-    np.random.seed(42)
-    n_periods = 252  # 1 year of daily returns
-    n_assets = 5
-    
+    # np.random.seed(42)
+    # n_periods = 252  # 1 year of daily returns
+    # n_assets = 5
     # Simulate returns with some correlation structure
-    true_mu = np.array([0.0008, 0.0006, 0.0007, 0.0005, 0.0009])
-    true_cov = np.array([
-        [0.0004, 0.0002, 0.0001, 0.0001, 0.0002],
-        [0.0002, 0.0003, 0.0001, 0.0001, 0.0001],
-        [0.0001, 0.0001, 0.0002, 0.0001, 0.0001],
-        [0.0001, 0.0001, 0.0001, 0.0002, 0.0001],
-        [0.0002, 0.0001, 0.0001, 0.0001, 0.0005]
-    ])
-    
-    returns = np.random.multivariate_normal(true_mu, true_cov, n_periods)
-    
+    # true_mu = np.array([0.0008, 0.0006, 0.0007, 0.0005, 0.0009])
+    # true_cov = np.array([
+    #     [0.0004, 0.0002, 0.0001, 0.0001, 0.0002],
+    #     [0.0002, 0.0003, 0.0001, 0.0001, 0.0001],
+    #     [0.0001, 0.0001, 0.0002, 0.0001, 0.0001],
+    #     [0.0001, 0.0001, 0.0001, 0.0002, 0.0001],
+    #     [0.0002, 0.0001, 0.0001, 0.0001, 0.0005]
+    # ])
+    # returns = np.random.multivariate_normal(true_mu, true_cov, n_periods)
     # Create DataFrame
-    asset_names = ['Tech', 'Finance', 'Healthcare', 'Energy', 'Consumer']
-    returns_df = pd.DataFrame(returns, columns=asset_names)
+    # asset_names = ['Tech', 'Finance', 'Healthcare', 'Energy', 'Consumer']
+    # returns_df = pd.DataFrame(returns, columns=asset_names)
     
     print("=" * 80)
     print("ROBUST PORTFOLIO OPTIMIZATION SUITE")
     print("=" * 80)
-    print(f"\nDataset: {n_periods} periods, {n_assets} assets")
-    print(f"Assets: {asset_names}")
-    
+
+    # Download financial data
+    assets, asset_df = download_fin_data(ticker)
+    assets = assets.sort_values(by=['Ticker', 'month_id']).reset_index(drop=True)
+    # Reshaping data to (time_steps, n_assets)
+    returns_df = assets.pivot(index='month_id', columns='Ticker', values='ret').reset_index()
+
+    # Prepare returns DataFrame
+    returns_df = returns_df.drop(columns=['month_id'])
+    # Only asset data with index larger 839
+    returns_df = returns_df[returns_df.index > 839]
+    returns_df = returns_df.fillna(0.0)  # Fill missing values with 0.0
+
+    returns_df = returns_df*100  # Convert to percentage returns
+        
+    print(f"\nDataset: {len(assets['month_id'].unique())} periods, {len(assets['Ticker'].unique())} assets")
+    # print(f"Assets: {asset_names}")
+
     # Initialize optimizer
     optimizer = PortfolioOptimizer(returns_df)
     
@@ -991,17 +1083,34 @@ if __name__ == "__main__":
     print("COMPARING ALL OPTIMIZATION METHODS")
     print("=" * 80)
     
-    comparison = optimizer.compare_all_methods(risk_free_rate=0.0001)
+    results, comparison = compare_all_methods(optimizer)
     
-    print("\n" + comparison.to_string(index=False))
+    # print("\n" + comparison.to_string(index=False))
+
+    # Display detailed results
+    print("\n" + "=" * 60)
+    print("DETAILED RESULTS SUMMARY")
+    print("=" * 60)
+    
+    for method, stats in results.items():
+        print(f"\n{method}:")
+        print(f"  Sharpe Ratio: {stats['sharpe_ratio']*np.sqrt(12):.4f}")
+        print(f"  Expected Return (annual): {stats['expected_return']:.4f}")
+        print(f"  Volatility (annual): {stats['volatility']:.4f}")
+        # print("  Weights:")
+        # for asset, weight in stats['weights'].items():
+        #    if weight > 0.01:  # Only show weights > 1%
+        #        print(f"    {asset}: {weight:.3f}")
     
     # Display weights
-    print("\n" + "=" * 80)
-    print("PORTFOLIO WEIGHTS BY METHOD")
-    print("=" * 80)
+    weights_df = pd.DataFrame()
+    for method, stats in results.items():
+        weights_df[method] = pd.Series(stats['weights'])
     
-    weights_df = optimizer.get_weights_dataframe()
-    print("\n" + weights_df.to_string())
+    # Display only methods that have weights
+    if not weights_df.empty:
+        print("\nPortfolio Weights by Method:")
+        print(weights_df.round(3))
     
     print("\n" + "=" * 80)
     print("ANALYSIS COMPLETE")
@@ -1009,5 +1118,6 @@ if __name__ == "__main__":
     print("\nKey Observations:")
     print("- Classical Markowitz may show concentrated positions")
     print("- Robust methods generally produce more diversified portfolios")
-    print("- Elastic Net creates sparse portfolios (fewer active positions)")
     print("- Resampling and shrinkage methods balance performance and stability")
+    print("- Elastic Net creates sparse portfolios (fewer active positions)")
+    
