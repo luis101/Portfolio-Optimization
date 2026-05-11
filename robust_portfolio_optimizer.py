@@ -1,20 +1,11 @@
 
-"""
-Robust Portfolio Optimization Suite
-Implements multiple approaches to robust portfolio optimization including:
-1. Classical Markowitz optimization
-2. Worst-case optimization with ellipsoidal uncertainty sets
-3. Black-Litterman (Bayesian approach)
-4. Resampling methods
-5. Robust covariance estimation (Ledoit-Wolf and Factor Models)
-6. Distributional robustness with Wasserstein distance
-7. Regularization with L1, L2, or as Elastic Net
-"""
+
+###### Robust Portfolio Optimization Suite ##########################################
+
 
 import numpy as np
 import pandas as pd
 import cvxpy as cp
-import yfinance as yf
 from scipy.optimize import minimize
 from scipy.stats import norm
 from sklearn.linear_model import LinearRegression
@@ -24,7 +15,16 @@ warnings.filterwarnings('ignore')
 
 class PortfolioOptimizer:
     """
-    A comprehensive portfolio optimization class with multiple robust methods
+    A comprehensive portfolio optimization class with multiple robust methods.
+
+    Implements multiple approaches to robust portfolio optimization including:
+    1. Classical Markowitz optimization
+    2. Worst-case optimization with ellipsoidal uncertainty sets
+    3. Black-Litterman (Bayesian approach)
+    4. Resampling methods
+    5. Robust covariance estimation (Ledoit-Wolf and Factor Models)
+    6. Distributional robustness with Wasserstein distance
+    7. Regularization with L1, L2, or as Elastic Net
     """
     
     def __init__(self, returns_data, risk_free_rate=0.0):
@@ -199,8 +199,6 @@ class PortfolioOptimizer:
         norm_type : int
             Norm type for Wasserstein distance (1 or 2)
         """
-
-        # Direct Wasserstein robust optimization
 
         w = cp.Variable(self.n_assets)
 
@@ -838,286 +836,4 @@ class PortfolioOptimizer:
         #         'n_nonzero': np.sum(weights > 1e-4), 'method': 'Elastic Net Regularization'}
         
         return weights
-    
-
-# ======= UTILITY FUNCTIONS FOR COMPARISON AND OUTPUT ========================
-
-# Download or generate returns data
-
-# ticker = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'FB', 'TSLA', 'BRK-B', 'JPM', 'JNJ', 'V',
-#          'WMT', 'PG', 'UNH', 'DIS', 'NVDA', 'HD', 'MA', 'PYPL', 'BAC', 'VZ']
-ticker = ['^GSPC', '^IXIC', '^DJI', '^GDAXI', '^FTSE', '^FCHI', '^HSI', '^AXJO', 
-          '^BSESN', '^TWII', '^MXX', '^KS11', '^N225', '^BVSP', '^STI']
-
-def download_fin_data(ticker, start_date = "1985-01-01",
-                      end_date = "2025-09-30"):
-    
-    asset_df = pd.DataFrame()
-    assets = pd.DataFrame()
-
-    # Define the stock symbol and loop over symbols
-
-    for symbol in ticker:
-        
-        # Download historical data
-        
-        print("Ticker: "+symbol)
-        
-        asset_data = yf.download(symbol, start=start_date, end=end_date)
-        asset_data = asset_data.stack(1)
-        asset_data = asset_data.reset_index(level=1)
-
-        asset_data['month_id'] = asset_data.index.strftime('%Y-%m')
-        asset_data['numst'] = asset_data.groupby(['month_id'])['Ticker'].transform('count')
-        asset_data = asset_data[(asset_data['numst']>=17)]
-
-        data_at = asset_data.groupby(['month_id']).last().reset_index()
-        asset_df = pd.concat([asset_df, data_at], axis=0)
-
-        # Load historical data
-
-        asset = yf.Ticker(symbol)
-        try:
-            data = asset.history(period="max")
-        except:
-            continue
-        
-        if len(data) == 0:
-            continue
-
-        data['Ticker'] = symbol
-
-        data['month_id'] = data.index.strftime('%Y-%m')
-        data[['Vol', 'Div']] = data.groupby(['month_id'])[['Volume', 'Dividends']].transform('sum')
-        data['numst'] = data.groupby(['month_id'])['Ticker'].transform('count')
-
-        sdf = data.groupby(['month_id']).last().reset_index()
-        # sdf["ret"] = ((sdf["Close"]+sdf['Div']) - sdf["Close"].shift(1)) / sdf["Close"].shift(1)
-        # sdf["ret"] = sdf["Close"].pct_change().fillna(0) + (sdf['Div'] / sdf["Close"].shift(1)).fillna(0)
-        sdf["ret"] = sdf["Close"].pct_change().fillna(0)
-        sdf = sdf[(sdf['numst']>=17)]
-
-        sdf = sdf[['month_id', 'Ticker', 'Close', 'Volume', 'Div', 'ret']]
-
-        assets = pd.concat([assets, sdf], axis=0)
-        
-        #del sdf
-        #gc.collect()
-
-    return assets, asset_df
-
-# Compare all methods
-
-def compare_all_methods(optimizer):
-    """
-    Run all optimization methods and compare results.
-    
-    Returns:
-    --------
-    pd.DataFrame : Comparison of all methods
-    """
-    # results = []
-    results = {}
-    
-    # 1. Markowitz
-    try:
-        weights_mv = optimizer.mean_variance_optimization()
-        stats_mv = optimizer.calculate_portfolio_stats(weights_mv)
-        results["Classical Mean Variance"] = stats_mv
-        #results.append(res)
-    except Exception as e:
-        print(f"Mean-Variance failed: {e}")
-
-    # 1. Min Variance
-    try:
-        weights_minvar = optimizer.min_variance()
-        stats_minvar = optimizer.calculate_portfolio_stats(weights_minvar)
-        results["Minimum Variance"] = stats_minvar
-        #results.append(res)
-    except Exception as e:
-        print(f"Minimum Variance failed: {e}")
-
-    # 3. Wasserstein
-    try:
-        weights_wasserstein = optimizer.wasserstein_optimization()
-        stats_wasserstein = optimizer.calculate_portfolio_stats(weights_wasserstein)
-        results["Wasserstein"] = stats_wasserstein
-        # results.append(res)
-    except Exception as e:
-        print(f"Wasserstein failed: {e}")
-
-    # 4. Worst-case Ellipsoidal
-    try:
-        weights_worst_case = optimizer.ellipsoidal_uncertainty_optimization()
-        stats_worst_case = optimizer.calculate_portfolio_stats(weights_worst_case)
-        results["Worst-case Ellipsoidal"] = stats_worst_case
-        # results.append(res)
-    except Exception as e:
-        print(f"Worst-case failed: {e}")
-    
-    # 5. Black-Litterman
-    try:
-        weights_black_litterman = optimizer.black_litterman()
-        stats_black_litterman = optimizer.calculate_portfolio_stats(weights_black_litterman)
-        results["Black-Litterman"] = stats_black_litterman
-        # results.append(res)
-    except Exception as e:
-        print(f"Black-Litterman failed: {e}")
-    
-    # 6. Resampled
-    try:
-        weights_resampled = optimizer.resampling_optimization()
-        stats_resampled = optimizer.calculate_portfolio_stats(weights_resampled)
-        results["Resampled"] = stats_resampled
-        # results.append(res)
-    except Exception as e:
-        print(f"Resampled failed: {e}")
-    
-    # 7. Ledoit-Wolf Shrinkage
-    try:
-        weights_ledoit_wolf = optimizer.shrinkage_covariance_optimization()
-        stats_ledoit_wolf = optimizer.calculate_portfolio_stats(weights_ledoit_wolf)
-        results["Ledoit-Wolf Shrinkage"] = stats_ledoit_wolf
-        # results.append(res)
-    except Exception as e:
-        print(f"Ledoit-Wolf failed: {e}")
-    
-    # 8. Factor Model
-    try:
-        weights_factor_model = optimizer.factor_model_optimization()
-        stats_factor_model = optimizer.calculate_portfolio_stats(weights_factor_model)
-        results["Factor Model"] = stats_factor_model
-        # results.append(res)
-    except Exception as e:
-        print(f"Factor Model failed: {e}")
-
-    # 9. CVaR Optimization
-    try:    
-        weights_cvar = optimizer.cvar_optimization()
-        stats_cvar = optimizer.calculate_portfolio_stats(weights_cvar)
-        results["CVaR Optimization"] = stats_cvar
-        # results.append(res)
-    except Exception as e:
-        print(f"CVaR Optimization failed: {e}")
-    
-    # 10. Wasserstein CVaR
-    try:
-        weights_wasserstein_cvar = optimizer.wasserstein_cvar_optimization()
-        stats_wasserstein_cvar = optimizer.calculate_portfolio_stats(weights_wasserstein_cvar)
-        results["Wasserstein CVaR"] = stats_wasserstein_cvar
-        # results.append(res)    
-    except Exception as e:
-        print(f"Wasserstein CVaR failed: {e}")
-    
-    # 11. Elastic Net
-    try:
-        weights_elastic_net = optimizer.elastic_net_optimization()
-        stats_elastic_net = optimizer.calculate_portfolio_stats(weights_elastic_net)
-        results["Elastic Net"] = stats_elastic_net
-    except Exception as e:
-        print(f"Elastic Net failed: {e}")
-    
-    # Create comparison DataFrame
-    # comparison_data = []
-    # for res in results:
-        # comparison_data.append({
-        # 'Method': res['method'], 'Return': res['return'], 'Volatility': res['volatility'],
-        # 'Sharpe': res['sharpe'], 'Max Weight': np.max(res['weights']), 
-        # 'Min Weight': np.min(res['weights'][res['weights'] > 1e-4]), 'N Assets': np.sum(res['weights'] > 1e-4)})
-    #comparison_df = pd.DataFrame(comparison_data)
-    
-    comparison_df = pd.DataFrame.from_dict(results, orient='index')
-    comparison_df = comparison_df.reset_index().rename(columns={'index': 'Method'})
-
-    return results, comparison_df
-
-
-# ======= EXAMPLE USAGE ======================================================
-
-if __name__ == "__main__":
-    
-    # Generate synthetic returns data
-    # np.random.seed(42)
-    # n_periods = 252  # 1 year of daily returns
-    # n_assets = 5
-    # Simulate returns with some correlation structure
-    # true_mu = np.array([0.0008, 0.0006, 0.0007, 0.0005, 0.0009])
-    # true_cov = np.array([
-    #     [0.0004, 0.0002, 0.0001, 0.0001, 0.0002],
-    #     [0.0002, 0.0003, 0.0001, 0.0001, 0.0001],
-    #     [0.0001, 0.0001, 0.0002, 0.0001, 0.0001],
-    #     [0.0001, 0.0001, 0.0001, 0.0002, 0.0001],
-    #     [0.0002, 0.0001, 0.0001, 0.0001, 0.0005]
-    # ])
-    # returns = np.random.multivariate_normal(true_mu, true_cov, n_periods)
-    # Create DataFrame
-    # asset_names = ['Tech', 'Finance', 'Healthcare', 'Energy', 'Consumer']
-    # returns_df = pd.DataFrame(returns, columns=asset_names)
-    
-    print("=" * 80)
-    print("ROBUST PORTFOLIO OPTIMIZATION SUITE")
-    print("=" * 80)
-
-    # Download financial data
-    assets, asset_df = download_fin_data(ticker)
-    assets = assets.sort_values(by=['Ticker', 'month_id']).reset_index(drop=True)
-    # Reshaping data to (time_steps, n_assets)
-    returns_df = assets.pivot(index='month_id', columns='Ticker', values='ret').reset_index()
-
-    # Prepare returns DataFrame
-    returns_df = returns_df.drop(columns=['month_id'])
-    # Only asset data with index larger 839
-    returns_df = returns_df[returns_df.index > 839]
-    returns_df = returns_df.fillna(0.0)  # Fill missing values with 0.0
-
-    returns_df = returns_df*100  # Convert to percentage returns
-        
-    print(f"\nDataset: {len(assets['month_id'].unique())} periods, {len(assets['Ticker'].unique())} assets")
-    # print(f"Assets: {asset_names}")
-
-    # Initialize optimizer
-    optimizer = PortfolioOptimizer(returns_df)
-    
-    # Compare all methods
-    print("\n" + "=" * 80)
-    print("COMPARING ALL OPTIMIZATION METHODS")
-    print("=" * 80)
-    
-    results, comparison = compare_all_methods(optimizer)
-    
-    # print("\n" + comparison.to_string(index=False))
-
-    # Display detailed results
-    print("\n" + "=" * 60)
-    print("DETAILED RESULTS SUMMARY")
-    print("=" * 60)
-    
-    for method, stats in results.items():
-        print(f"\n{method}:")
-        print(f"  Sharpe Ratio: {stats['sharpe_ratio']*np.sqrt(12):.4f}")
-        print(f"  Expected Return (annual): {stats['expected_return']:.4f}")
-        print(f"  Volatility (annual): {stats['volatility']:.4f}")
-        # print("  Weights:")
-        # for asset, weight in stats['weights'].items():
-        #    if weight > 0.01:  # Only show weights > 1%
-        #        print(f"    {asset}: {weight:.3f}")
-    
-    # Display weights
-    weights_df = pd.DataFrame()
-    for method, stats in results.items():
-        weights_df[method] = pd.Series(stats['weights'])
-    
-    # Display only methods that have weights
-    if not weights_df.empty:
-        print("\nPortfolio Weights by Method:")
-        print(weights_df.round(3))
-    
-    print("\n" + "=" * 80)
-    print("ANALYSIS COMPLETE")
-    print("=" * 80)
-    print("\nKey Observations:")
-    print("- Classical Markowitz may show concentrated positions")
-    print("- Robust methods generally produce more diversified portfolios")
-    print("- Resampling and shrinkage methods balance performance and stability")
-    print("- Elastic Net creates sparse portfolios (fewer active positions)")
     
