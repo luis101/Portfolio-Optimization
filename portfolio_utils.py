@@ -76,23 +76,39 @@ def compare_all_methods(optimizer):
     results = {}
 
     _methods = [
-        ("Classical Mean Variance", lambda: optimizer.mean_variance_optimization()),
-        ("Minimum Variance",        lambda: optimizer.min_variance()),
-        ("Wasserstein",             lambda: optimizer.wasserstein_optimization()),
-        ("Worst-case Ellipsoidal",  lambda: optimizer.ellipsoidal_uncertainty_optimization()),
-        ("Black-Litterman",         lambda: optimizer.black_litterman()),
-        ("Resampled",               lambda: optimizer.resampling_optimization()),
-        ("Ledoit-Wolf Shrinkage",   lambda: optimizer.shrinkage_covariance_optimization()),
-        ("Factor Model",            lambda: optimizer.factor_model_optimization()),
-        ("CVaR Optimization",       lambda: optimizer.cvar_optimization()),
-        ("Wasserstein CVaR",        lambda: optimizer.wasserstein_cvar_optimization()),
-        ("Elastic Net",             lambda: optimizer.elastic_net_optimization()),
+        ("Classical Mean Variance",  lambda: optimizer.mean_variance_optimization()),
+        ("Minimum Variance",         lambda: optimizer.min_variance()),
+        ("Wasserstein",              lambda: optimizer.wasserstein_optimization()),
+        ("Worst-case Ellipsoidal",   lambda: optimizer.ellipsoidal_uncertainty_optimization()),
+        ("Black-Litterman",          lambda: optimizer.black_litterman()),
+        ("Resampled",                lambda: optimizer.resampling_optimization()),
+        ("Ledoit-Wolf Shrinkage",    lambda: optimizer.shrinkage_covariance_optimization()),
+        ("MCD",                      lambda: optimizer.mcd_robust_covariance_optimization()),
+        ("Factor Model",             lambda: optimizer.factor_model_optimization()),
+        ("CVaR Optimization",        lambda: optimizer.cvar_optimization()),
+        ("Wasserstein CVaR",         lambda: optimizer.wasserstein_cvar_optimization()),
+        ("Mean-CDaR",                lambda: optimizer.cdar_optimization()),
+        ("Elastic Net",              lambda: optimizer.elastic_net_optimization()),
+        ("Hierarchical Risk Parity", lambda: optimizer.hierarchical_risk_parity()),
+        ("Risk Parity",              lambda: optimizer.risk_parity_optimization()),
+        ("Maximum Diversification",  lambda: optimizer.maximum_diversification()),
+        ("CVaR Risk Parity (ERC)",   lambda: optimizer.cvar_risk_parity_optimization()),
+        ("CDaR Risk Parity (ERC)",   lambda: optimizer.cdar_risk_parity_optimization()),
+        # Kelly needs decimal gross returns, data is in percentage points -> return_scale=100
+        ("Kelly (Full)",             lambda: optimizer.kelly_optimization(fraction=1.0, return_scale=100)),
+        ("Kelly (Half)",             lambda: optimizer.kelly_optimization(fraction=0.5, return_scale=100)),
+        ("Worst-Case Kelly",         lambda: optimizer.worst_case_kelly_optimization(alpha=0.1, return_scale=100)),
+        ("Equal Weight",             lambda: optimizer.equal_weight_portfolio())
     ]
 
     for name, fn in _methods:
         try:
             weights = fn()
-            results[name] = optimizer.calculate_portfolio_stats(weights)
+            stats = optimizer.calculate_portfolio_stats(weights)
+            if stats is None:  # solver returned no optimal solution
+                print(f"{name} failed: no optimal solution")
+                continue
+            results[name] = stats
         except Exception as e:
             print(f"{name} failed: {e}")
 

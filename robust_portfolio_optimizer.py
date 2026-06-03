@@ -2,12 +2,33 @@
 
 ###### Robust Portfolio Optimization Suite ##########################################
 
+# Not included is a rolling backtest framework, which is critical for evaluating out-of-sample performance.
+# Fix an estimation window (e.g. 60 months)
+# Estimate weights on that window, hold for 1 period
+# Slide forward, repeat
+# Compute realized statistics on the held-out returns
+# Key out-of-sample metrics to compare:
+# Realized annualized Sharpe, Realized vs. predicted volatility ratio, Maximum drawdown, Portfolio turnover 
+# Effective N (1 / Σwᵢ²), statistical significance of Sharpe differences between methods
+
+# Potential additions:
+# 1/N equal weight. 
+# Risk Parity / Equal Risk Contribution (ERC). Allocates weights such that each asset contributes equally to total portfolio variance (wᵢ · (Σw)ᵢ = constant).
+# Hierarchical Risk Parity (HRP) (López de Prado, 2016). Uses hierarchical clustering on the correlation matrix to build a tree, 
+# then allocates risk top-down along the tree. Requires no matrix inversion, so it is robust to near-singular covariances.
+# Minimum Covariance Determinant (MCD) robust covariance. Your Ledoit-Wolf shrinkage handles estimation noise but not outliers. 
+# MCD fits the covariance on the subset of observations with the smallest determinant, making it resistant to return outliers (crises, flash crashes).
+# Transaction-cost-aware objective. Adding a turnover penalty κ · ‖w_t − w_{t-1}‖₁ to the CVXPY objective is a one-line change but makes the comparison realistic.
+
 
 import numpy as np
 import pandas as pd
 import cvxpy as cp
 from scipy.optimize import minimize
 from scipy.stats import norm
+from scipy.spatial.distance import squareform
+import scipy.cluster.hierarchy as sch
+from sklearn.covariance import MinCovDet
 from sklearn.linear_model import LinearRegression
 import matplotlib.pyplot as plt
 import warnings
@@ -18,25 +39,33 @@ class PortfolioOptimizer:
     A comprehensive portfolio optimization class with multiple robust methods.
 
     Implements multiple approaches to robust portfolio optimization including:
-    1. Classical Markowitz optimization
+    1. Classical Markowitz optimization + Minimum variance
     2. Worst-case optimization with ellipsoidal uncertainty sets
-    3. Black-Litterman (Bayesian approach)
-    4. Resampling methods
-    5. Robust covariance estimation (Ledoit-Wolf and Factor Models)
-    6. Distributional robustness with Wasserstein distance
-    7. Regularization with L1, L2, or as Elastic Net
+    3. Distributional robustness with Wasserstein distance
+    4. Black-Litterman (Bayesian approach)
+    5. Resampling methods
+    6. Robust covariance estimation (Ledoit-Wolf, MCD robust covariance, Factor Models)
+    7. Tail & drawdown risk optimization (CVaR, Wasserstein CVaR, Mean-CDaR)
+    8. Regularization with L1, L2, or as Elastic Net
+    9. Risk parity and hierarchical risk parity
+    10. Maximum diversification portfolio
+    11. Growth-optimal (Kelly) portfolios: full, fractional, and worst-case robust
+    12. Equal weight portfolio (naive diversification)
     """
     
-    def __init__(self, returns_data, risk_free_rate=0.0):
+    def __init__(self, returns_data, risk_free_rate=0.0, periods_per_year=12):
         """
         Initialize the optimizer with historical returns data
-        
+
         Parameters:
         -----------
         returns_data : pd.DataFrame or np.ndarray
             Historical returns (T x N) where T is time periods and N is assets
         risk_free_rate : float
-            Risk-free rate for Sharpe ratio calculations
+            Risk-free rate for Sharpe ratio calculations (per period)
+        periods_per_year : int
+            Number of return periods per year, used to annualize reported
+            statistics (12 for monthly, 252 for daily, etc.)
         """
 
         if isinstance(returns_data, pd.DataFrame):
@@ -51,25 +80,28 @@ class PortfolioOptimizer:
         self.n_assets = self.returns.shape[1]
         self.n_periods = self.returns.shape[0]
         self.rf = risk_free_rate
+        self.ppy = periods_per_year
         
-        # Calculate basic statistics
-        self.mu = np.mean(self.returns, axis=0)
-        self.cov = np.cov(self.returns.T)
+        # Calculate basic statistics (kept as plain ndarrays for uniform use downstream)
+        self.mu = np.asarray(np.mean(self.returns, axis=0))
+        self.cov = np.asarray(np.cov(self.returns.T))
 
     def calculate_portfolio_stats(self, weights):
-        """Calculate portfolio statistics"""
+        """Calculate portfolio statistics (returns/vol/Sharpe annualized via self.ppy)"""
         if weights is None:
             return None
-            
-        portfolio_return = self.mu @ weights
-        portfolio_volatility = np.sqrt(weights.T @ self.cov @ weights)
-        sharpe_ratio = portfolio_return / portfolio_volatility if portfolio_volatility > 0 else 0
-        
+
+        # Per-period figures
+        period_return = self.mu @ weights
+        period_volatility = np.sqrt(weights.T @ self.cov @ weights)
+        period_sharpe = (period_return - self.rf) / period_volatility if period_volatility > 0 else 0
+
+        # Annualized figures (returns scale with ppy, volatility/Sharpe with sqrt(ppy))
         return {
             'weights': dict(zip(self.assets, weights)),
-            'expected_return': portfolio_return,
-            'volatility': portfolio_volatility,
-            'sharpe_ratio': sharpe_ratio
+            'expected_return': period_return * self.ppy,
+            'volatility': period_volatility * np.sqrt(self.ppy),
+            'sharpe_ratio': period_sharpe * np.sqrt(self.ppy)
         }
         
     def _portfolio_performance(self, weights, mu, cov):
@@ -94,7 +126,7 @@ class PortfolioOptimizer:
             objective = cp.Minimize(cp.quad_form(w, cov))
         else:
             constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-            objective = cp.Minimize(-w.T @ self.mu + risk_aversion * cp.quad_form(w, cov))
+            objective = cp.Minimize(-w.T @ mu + risk_aversion * cp.quad_form(w, cov))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -188,48 +220,57 @@ class PortfolioOptimizer:
     # 2. WORST-CASE OPTIMIZATION
     # ========================================================================
 
-    def wasserstein_optimization(self, epsilon=0.1, kappa=1.0, norm_type=2, risk_aversion=1.0):
+    def wasserstein_optimization(self, epsilon=0.1, norm_type=2, risk_aversion=1.0):
         """
-        Distributionally robust optimization using Wasserstein distance
-        
-        Parameters:
-        -----------
+        Distributionally robust mean-variance over a type-2 Wasserstein ball around
+        the empirical distribution (Blanchet, Chen & Zhou 2022, Management Science).
+
+        Exact tractable reformulation ("square-root regularization"): the worst-case
+        portfolio standard deviation is the empirical std plus a sqrt(epsilon)-scaled
+        norm of the weights, and the worst-case mean shrinks by the same penalty:
+            sigma_wc(w) = sqrt(w' Σ w) + sqrt(epsilon) * ||w||
+            mu_wc(w)    = w'μ          - sqrt(epsilon) * ||w||
+        The robustification is additive in the *standard deviation*, not the variance.
+
+        Parameters
+        ----------
         epsilon : float
-            Wasserstein ball radius (robustness parameter)
+            Wasserstein ball radius (robustness parameter).
         norm_type : int
-            Norm type for Wasserstein distance (1 or 2)
+            Ground-cost norm. 2 -> Euclidean cost, penalty uses ||w||_2 (dual of l2);
+            1 -> l1 cost, penalty uses ||w||_inf (dual of l1).
+        risk_aversion : float
+            Trade-off weight on the (robust) variance term.
         """
 
         w = cp.Variable(self.n_assets)
 
-        # Portfolio return and variance
         portfolio_returns = w.T @ self.mu
-        portfolio_var = cp.quad_form(w, self.cov)
+        # portfolio_var = cp.quad_form(w, self.cov)
         # portfolio_std = cp.sqrt(portfolio_var)
 
-        # Worst-case adjustment (simplified Wasserstein penalty)
-        # Based on: E[R] - epsilon * ||grad E[R]||
+        sqrt_eps = np.sqrt(epsilon)
+
+        # Symmetric sqrt-factor of Σ so the empirical risk is a 2-norm (SOC)
+        vals, vecs = np.linalg.eigh(self.cov)
+        sigma_sqrt = vecs @ np.diag(np.sqrt(np.clip(vals, 0.0, None))) @ vecs.T
+
+        # Dual norm of the transport ground cost drives the robustness penalty
         if norm_type == 2:
-            # wasserstein_penalty = epsilon * portfolio_var * np.sqrt(self.n_assets)
-            # wasserstein_penalty = epsilon * np.sqrt(self.n_assets / self.n_periods)
-            wasserstein_penalty = epsilon * cp.norm(w, 2)
+            weight_penalty = cp.norm(w, 2)        # dual of Euclidean cost
+            # wasserstein_penalty = epsilon * cp.norm(w, 2)
         elif norm_type == 1:
-            wasserstein_penalty = epsilon * cp.norm(w, 1)
+            weight_penalty = cp.norm(w, "inf")    # dual of l1 cost
+            # wasserstein_penalty = epsilon * cp.norm(w, 1)
         else:
             raise ValueError("Unsupported norm type")
-        
-        # robust_return = portfolio_returns - wasserstein_penalty * np.sqrt(portfolio_var)
-        robust_return = portfolio_returns - wasserstein_penalty
 
-        # Worst-case variance (simplified conservative approximation)
-        worst_case_variance = portfolio_var + kappa * epsilon * cp.norm(w, 2)**2
+        # worst_case_variance = portfolio_var  + sqrt_eps * weight_penalty
+        worst_case_variance = cp.norm(sigma_sqrt @ w, 2) + sqrt_eps * weight_penalty  # robust std
+        robust_return = portfolio_returns - sqrt_eps * weight_penalty   # robust mean
 
-        # Objective: maximize risk-adjusted return
-        # objective = cp.Minimize(-(robust_return - self.rf) / portfolio_var)
-        # objective = cp.Minimize(-(robust_return - self.rf) + (risk_aversion / 2) * portfolio_var)
-        # objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * cp.quad_form(w, self.cov))¨
-        objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * worst_case_variance)
-
+        # Mean - risk_aversion * (robust variance), with robust variance = sigma_wc^2
+        objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * cp.square(worst_case_variance))
         constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
 
         prob = cp.Problem(objective, constraints)
@@ -237,8 +278,6 @@ class PortfolioOptimizer:
 
         weights = w.value if prob.status == 'optimal' else None
 
-        return weights
-    
         #def wasserstein_robust_objective(w, norm_type='2'):
             # """
             # Robust objective: minimize worst-case CVaR over Wasserstein ball
@@ -268,6 +307,8 @@ class PortfolioOptimizer:
         # return {'weights': weights, 'return': ret, 'volatility': vol, 'sharpe': (ret - self.rf) / vol,
         #        'epsilon': epsilon, 'method': 'Wasserstein Robust'}
 
+        return weights
+
     def ellipsoidal_uncertainty_optimization(self, kappa_mu=0.1, kappa_sigma=0.1, risk_aversion=1.0):
         """
         Robust optimization with ellipsoidal uncertainty sets
@@ -295,15 +336,22 @@ class PortfolioOptimizer:
         # bounds = tuple((0, 1) for _ in range(self.n_assets)) # No short selling
         # init_weights = np.ones(self.n_assets) / self.n_assets # Equal weights
         
-        # result = minimize(robust_objective, init_weights, method='SLSQP', bounds=bounds, constraints=constraints) 
+        # result = minimize(robust_objective, init_weights, method='SLSQP', 
+        # bounds=bounds, constraints=constraints) 
         # weights = result.x
 
         # Using cvxpy for robust optimization
         w = cp.Variable(self.n_assets)
 
+        # Symmetric matrix square root of the mean estimate's sampling covariance
+        # (cp.sqrt would be an element-wise sqrt. We need the matrix square root, which can be done via eigendecomposition.)
+        # Built via eigendecomposition with eigenvalues clipped at 0 to ensure positive semidefiniteness.
+        vals, vecs = np.linalg.eigh(self.cov / self.n_periods)
+        sigma_mu_sqrt = vecs @ np.diag(np.sqrt(np.clip(vals, 0.0, None))) @ vecs.T
+
         # Uncertainty sets
-        mu_uncertainty = kappa_mu * cp.norm(cp.sqrt(self.cov) @ w)
-        sigma_uncertainty = kappa_sigma * cp.norm(w, 2) 
+        mu_uncertainty = kappa_mu * cp.norm(sigma_mu_sqrt @ w, 2)  # kappa * sqrt(w' (Sigma/T) w)
+        sigma_uncertainty = kappa_sigma * cp.norm(w, 2)
 
         # Worst-case expected return (min over ellipsoidal uncertainty)
         worst_case_return = w.T @ self.mu - mu_uncertainty
@@ -335,10 +383,11 @@ class PortfolioOptimizer:
     # 3. BLACK-LITTERMAN MODEL
     # ========================================================================
 
-    def black_litterman(self, market_caps=None, tau=0.05, risk_aversion=2.5, views=None, view_confidences=None):
+    def black_litterman(self, market_caps=None, tau=0.05, risk_aversion=2.5,
+                        views=None, view_returns=None, view_confidences=None):
         """
         Black-Litterman model combining market equilibrium with investor views
-        
+
         Parameters:
         -----------
         market_caps : np.ndarray, optional
@@ -349,6 +398,9 @@ class PortfolioOptimizer:
             Market risk aversion coefficient
         views : np.ndarray, optional
             View matrix P (K x N) for K views on N assets
+        view_returns : np.ndarray, optional
+            View magnitudes Q (length K). The expected return implied by each view.
+            Defaults to zeros (no opinion on the level) when omitted.
         view_confidences : np.ndarray, optional
             Confidence in views (K x K diagonal matrix or vector) - higher means more confidence
             Reflecting Omega and omega_scale: Omega = np.eye(k) * omega_scale
@@ -370,7 +422,9 @@ class PortfolioOptimizer:
         # Else use views to adjust returns
         else:
             P = views  # View matrix
-            Q = np.zeros(len(views))  # View returns (example: all zeros)
+            # View magnitudes Q: expected return implied by each view.
+            # Defaults to zeros (no opinion on the level) when not supplied.
+            Q = np.zeros(len(views)) if view_returns is None else np.asarray(view_returns)
             
             # Omega: diagonal matrix of view uncertainties
             if view_confidences is None:
@@ -408,11 +462,13 @@ class PortfolioOptimizer:
         
         # weights = result.x
 
-        weights = self._solve_mean_variance_sample(mu_bl, cov_bl, target_return=None)
-        
+        weights = self._solve_mean_variance_sample(mu_bl, cov_bl, target_return=None,
+                                                   risk_aversion=risk_aversion)
+
         # ret, vol = self._portfolio_performance(weights, mu_bl, cov_bl)
         # return {'weights': weights, 'return': ret, 'volatility': vol, 
-        #        'sharpe': (ret - self.rf) / vol, 'posterior_returns': mu_bl, 'method': 'Black-Litterman'}
+        #        'sharpe': (ret - self.rf) / vol, 
+        #        'posterior_returns': mu_bl, 'method': 'Black-Litterman'}
         
         return weights
     
@@ -420,8 +476,7 @@ class PortfolioOptimizer:
     # 4. RESAMPLING
     # ========================================================================
     
-    def resampling_optimization(self, n_samples=1000, target_return=None, risk_aversion=1.0): 
-                                # seed=42):
+    def resampling_optimization(self, n_samples=1000, target_return=None, risk_aversion=1.0, seed=None):
         """
         Michaud's resampled efficient frontier approach.
         
@@ -433,17 +488,18 @@ class PortfolioOptimizer:
             Target return for optimization
         risk_free_rate : float
             Risk-free rate
-        seed : int
-            Random seed for reproducibility
+        seed : int, optional
+            Random seed for reproducibility (None for non-deterministic sampling)
         """
-        # np.random.seed(seed)
-        
+        # Local generator: reproducible without touching global NumPy RNG state
+        rng = np.random.default_rng(seed)
+
         # Store weights from each resampled optimization
         resampled_weights = []
 
         for _ in range(n_samples):
             # Resample returns (bootstrap)
-            indices = np.random.choice(self.n_periods, size=self.n_periods, replace=True)
+            indices = rng.choice(self.n_periods, size=self.n_periods, replace=True)
             sample_returns = self.returns.iloc[indices]
             # sample_returns = self.returns[sample_idx]
             
@@ -507,6 +563,8 @@ class PortfolioOptimizer:
     # 5. ROBUST COVARIANCE ESTIMATION
     # ========================================================================
     
+    # Ledoit-Wolf shrinkage covariance estimation
+    
     def shrinkage_covariance_optimization(self, risk_aversion=1.0):
         """
         Optimization using Ledoit-Wolf shrinkage covariance estimator
@@ -521,7 +579,8 @@ class PortfolioOptimizer:
         # result = minimize(self._neg_sharpe, init_weights, args=(self.mu, cov_lw, self.rf),
         #                   method='SLSQP', bounds=bounds, constraints=constraints)
 
-        weights = self._solve_mean_variance_sample(self.mu, cov_lw, risk_aversion=risk_aversion, target_return=None)
+        weights = self._solve_mean_variance_sample(self.mu, cov_lw, risk_aversion=risk_aversion, 
+                                                   target_return=None)
         
         # weights = result.x
         # ret, vol = self._portfolio_performance(weights, self.mu, cov_lw)
@@ -612,6 +671,46 @@ class PortfolioOptimizer:
         
         return cov_shrunk
     
+    # Minimum covariance determinant (MCD) robust covariance estimation
+
+    def mcd_robust_covariance_optimization(self, risk_aversion=1.0, support_fraction=None, 
+                                           random_state=None):
+        """
+        Minimum Covariance Determinant (MCD) robust covariance estimation
+
+        Parameter:
+        ----------
+        support_fraction : float, optional (default=None)
+            Fraction of observations to include in the support of the raw MCD estimate.
+            Typically between 0.5 and 1.0, with 0.75 being a common choice for moderate robustness.
+        """
+        # MCD estimator
+        mcd = MinCovDet(support_fraction=support_fraction, random_state=random_state)
+
+        # Fit on returns data
+        mcd.fit(self.returns)
+        mu_mcd = mcd.location_
+        cov_mcd = mcd.covariance_
+
+        # constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+        # bounds = tuple((0, 1) for _ in range(self.n_assets))
+        # init_weights = np.ones(self.n_assets) / self.n_assets
+        
+        # result = minimize(self._neg_sharpe, init_weights, args=(self.mu, cov_lw, self.rf),
+        #                   method='SLSQP', bounds=bounds, constraints=constraints)
+
+        weights = self._solve_mean_variance_sample(mu_mcd, cov_mcd, risk_aversion=risk_aversion, 
+                                                   target_return=None)
+        
+        # weights = result.x
+        # ret, vol = self._portfolio_performance(weights, mu_mcd, cov_mcd)
+        # return {'weights': weights, 'return': ret, 'volatility': vol, 'sharpe': (ret - self.rf) / vol,
+        #         'shrinkage_covariance': cov_mcd, 'method': 'MCD Robust Covariance'}
+
+        return weights
+    
+    # Factor model covariance estimation
+    
     def factor_model_optimization(self, n_factors=3, factor_returns=None):
         """
         Optimization using factor model for covariance estimation
@@ -631,9 +730,9 @@ class PortfolioOptimizer:
             specific_var = np.zeros(self.n_assets)
             
             for i in range(self.n_assets):
-                model = LinearRegression().fit(factor_returns, self.returns[:, i], fit_intercept=True)
+                model = LinearRegression(fit_intercept=True).fit(factor_returns, self.returns.iloc[:, i])
                 factor_loadings[i, :] = model.coef_
-                residuals = self.returns[:, i] - model.predict(factor_returns)
+                residuals = self.returns.iloc[:, i] - model.predict(factor_returns)
                 specific_var[i] = np.var(residuals)
             
             # Factor covariance
@@ -681,13 +780,13 @@ class PortfolioOptimizer:
         
         # weights = result.x
         # ret, vol = self._portfolio_performance(weights, self.mu, cov_factor)
-        # return {'weights': weights, 'return': ret, 'volatility': vol, 'sharpe': (ret - self.rf) / vol, 
-        #         'n_factors': k, 'method': 'Factor Model Covariance'}
+        # return {'weights': weights, 'return': ret, 'volatility': vol, 
+        #         'sharpe': (ret - self.rf) / vol, 'n_factors': k, 'method': 'Factor Model Covariance'}
     
         return weights
     
     # ========================================================================
-    # 6. CVAR OPTIMIAZATION
+    # 6. TAIL & DRAWDOWN RISK OPTIMIZATION (CVaR / CDaR)
     # ========================================================================
 
     def cvar_optimization(self, alpha=0.05, risk_aversion=1.0):
@@ -707,8 +806,8 @@ class PortfolioOptimizer:
         ]
         
         CVaR = VaR + (1/(alpha * self.n_periods)) * cp.sum(loss)
-        expected_return = self.mu.values @ w
-        
+        expected_return = self.mu @ w
+
         objective = cp.Minimize(-expected_return + risk_aversion * CVaR)
         
         prob = cp.Problem(objective, constraints)
@@ -722,6 +821,10 @@ class PortfolioOptimizer:
         """
         Wasserstein robust CVaR optimization
         Combines distributional robustness with tail risk management
+
+        Wasserstein robust CVaR (Mohajerin Esfahani & Kuhn 2018): 
+        For a type-1 ball with Euclidean cost and a loss affine in the returns, the worst-case CVaR is
+        the empirical CVaR plus epsilon times the dual-norm Lipschitz constant ||w||_2.
         """
         
         w = cp.Variable(self.n_assets)
@@ -738,16 +841,10 @@ class PortfolioOptimizer:
         # Empirical CVaR
         CVaR = VaR + (1/(alpha * self.n_periods)) * cp.sum(loss)
         
-        # Wasserstein robust CVaR (conservative approximation)
-        # Add robustness margin based on epsilon and portfolio norm
-        if hasattr(cp, 'norm'):
-            robustness_margin = epsilon * cp.norm(w, 2) / alpha
-        else:
-            # robustness_margin = epsilon * cp.sqrt(cp.sum_squares(w)) / alpha
-            robustness_margin = epsilon * cp.sqrt(cp.quad_form(w, self.cov)) * np.sqrt(self.n_assets) / alpha
-            
+        robustness_margin = epsilon * cp.norm(w, 2)
+
         robust_CVaR = CVaR + robustness_margin
-        expected_return = self.mu.values @ w - epsilon * cp.norm(w, 2)  # Worst-case return
+        expected_return = self.mu @ w - epsilon * cp.norm(w, 2)  # Worst-case mean (same margin)
         
         objective = cp.Minimize(-expected_return + risk_aversion * robust_CVaR)
         
@@ -755,8 +852,61 @@ class PortfolioOptimizer:
         prob.solve()
 
         weights = w.value if prob.status == 'optimal' else None
-        
-        return weights 
+
+        return weights
+
+    def cdar_optimization(self, alpha=0.05, risk_aversion=1.0):
+        """
+        Mean-Conditional Drawdown-at-Risk (Mean-CDaR) optimization
+        (Chekhlov, Uryasev & Zabarankin, 2005).
+
+        CDaR is the drawdown analogue of CVaR: the average of the worst (alpha-tail)
+        portfolio drawdowns along the cumulative-return path. Unlike CVaR, a single-
+        period tail loss, CDaR penalises sustained peak-to-trough declines, which makes
+        it well suited to long-horizon investors who care about drawdown risk.
+
+        Parameters
+        ----------
+        alpha : float
+            Tail probability for the drawdown (e.g. 0.05 -> average of the worst 5%
+            drawdowns; alpha -> 1 approaches the average drawdown, alpha -> 0 the maximum).
+        risk_aversion : float
+            Trade-off weight on CDaR versus expected return.
+        """
+        T = self.n_periods
+
+        # Uncompounded cumulative return path is affine in w:
+        #   C_t = sum_{k<=t} (R_k . w) = (tril(ones) @ R) @ w
+        cum_returns = np.tril(np.ones((T, T))) @ self.returns.values  # (T, N)
+
+        w = cp.Variable(self.n_assets)
+        u = cp.Variable(T)    # running peak (high-water mark) of the cumulative path
+        z = cp.Variable(T)    # drawdown exceedances over the threshold zeta
+        zeta = cp.Variable()  # Drawdown-at-Risk threshold (DaR)
+
+        cumulative = cum_returns @ w  # cumulative return at each t (affine in w)
+
+        constraints = [
+            cp.sum(w) == 1, w >= 0, w <= 1,
+            u >= cumulative,            # peak is at least the current cumulative value
+            u[1:] >= u[:-1],            # peak is non-decreasing (running maximum)
+            u >= 0,                     # peak measured from initial capital (drawdown from 0)
+            z >= u - cumulative - zeta, # exceedance of drawdown D_t = u - cumulative over zeta
+            z >= 0
+        ]
+
+        # Rockafellar-Uryasev representation of CDaR: minimize over zeta the sum of zeta and the average exceedance
+        CDaR = zeta + (1.0 / (alpha * T)) * cp.sum(z)
+        expected_return = self.mu @ w
+
+        objective = cp.Minimize(-expected_return + risk_aversion * CDaR)
+
+        prob = cp.Problem(objective, constraints)
+        prob.solve()
+
+        weights = w.value if prob.status == 'optimal' else None
+
+        return weights
 
     # ========================================================================
     # 7. ELASTIC NET REGULARIZATION
@@ -777,8 +927,8 @@ class PortfolioOptimizer:
 
         w = cp.Variable(self.n_assets)
 
-        # Portfolio return and risk 
-        portfolio_return = self.mu.values @ w
+        # Portfolio return and risk
+        portfolio_return = self.mu @ w
         portfolio_var = cp.quad_form(w, self.cov)
         
         # Sharpe ratio component
@@ -789,6 +939,8 @@ class PortfolioOptimizer:
         utility = portfolio_return - (risk_aversion / 2) * portfolio_var
         
         # Elastic Net penalty: lambda1 * ||w||_1 + lambda2 * ||w||_2^2
+        # Effectively L1 encourages sparsity (fewer assets), while L2 encourages diversification (smaller weights)
+
         # l1_penalty = lambda_l1 * w.sum()
         l1_penalty = lambda_l1 * cp.norm1(w)
         # l2_penalty = lambda_l2 * np.sum(w**2)
@@ -834,6 +986,496 @@ class PortfolioOptimizer:
         # ret, vol = self._portfolio_performance(weights, self.mu, self.cov) 
         # return {'weights': weights, 'return': ret, 'volatility': vol, 'sharpe': (ret - self.rf) / vol,
         #         'n_nonzero': np.sum(weights > 1e-4), 'method': 'Elastic Net Regularization'}
+        
+        return weights
+    
+    # ========================================================================
+    # 8. RISK BASED ALLOCATION
+    # ========================================================================
+
+    # 1. Hierarchical Risk Parity (HRP)
+    
+    def hierarchical_risk_parity(self, cov=None, method="ward"):
+        """
+        Performs Hierarchical Risk Parity (HRP) based on Marcos Lopez de Prado.
+        1. Tree Clustering (Hierarchical Clustering via correlation distance)
+        2. Quasi-Diagonalization (Sorting covariance matrix)
+        3. Recursive Bisection (Inverse-variance allocation across clusters)
+
+        Parameters:
+        cov : np.ndarray, optional
+        Covariance matrix to use (if None, uses self.cov)
+        method : str
+        'single' for single linkage, 'ward' for Ward's method (more balanced clusters)
+        """
+
+        cov = cov if cov is not None else self.cov
+
+        # Step 1: Tree Clustering
+        corr = cov / np.sqrt(np.outer(np.diag(cov), np.diag(cov)))
+        # corr = pd.DataFrame(self.Sigma, index=self.assets, columns=self.assets)
+        # corr = self.returns.corr()
+        distance = np.sqrt(0.5 * (1.0 - corr))   
+        dist_flat = squareform(distance, checks=False)
+
+        if method == "ward":
+            try:
+                # Try Ward's method first (more balanced clusters)
+                linkage = sch.linkage(dist_flat, method='ward')
+            except:
+                # Fallback: average linkage
+                linkage = sch.linkage(dist_flat, method='average')
+
+        else:
+            linkage = sch.linkage(dist_flat, method=method)
+
+        # Step 2: Quasi-Diagonalization
+        # Get sorted indices from hierarchical clustering
+        sorted_indices = sch.leaves_list(linkage)
+        assets_sorted = [self.assets[i] for i in sorted_indices]
+        cov_sorted = cov[sorted_indices][:, sorted_indices]
+
+        # Step 3: Recursive Bisection
+        # weights = pd.Series(1.0, index=range(self.n_assets))  
+        weights = np.ones(self.n_assets, dtype=np.float64) # Start with equal weights
+
+        def _cluster_var(cov, indices):
+            """Variance of the inverse-variance portfolio within a cluster"""
+            sub_cov = cov[np.ix_(indices, indices)]
+            ivp     = 1.0 / np.diag(sub_cov)
+            ivp    /= ivp.sum()
+            return float(ivp @ sub_cov @ ivp)
+
+        def _recursive_bisection(indices=None):   
+            """Recursively allocate weights to clusters"""
+            n = self.cov.shape[0]
+            if indices is None:
+                indices = range(n)
+
+            if len(indices) == 1:
+                return np.array([1.0])  # Single asset gets all weight
+            
+            if len(indices) <= 1:
+                return
+            
+            # Split into two clusters
+            split = len(indices) // 2
+            left_indices = indices[:split]
+            right_indices = indices[split:]
+
+            # Compute inverse variance for each cluster
+            var_left = _cluster_var(cov, left_indices)
+            var_right = _cluster_var(cov, right_indices)
+
+            # No division by zero - if both variances are zero, split equally
+            alpha = 1.0 - (var_left / (var_left + var_right)) if (var_left + var_right) > 1e-8 else 0.5
+            
+            # Allocate weights to clusters
+            weights[left_indices] *= alpha
+            weights[right_indices] *= (1.0 - alpha)
+
+            # Recurse on each cluster
+            _recursive_bisection(left_indices)
+            _recursive_bisection(right_indices)
+
+        def _recursive_bisection_alternative(cov, indices=None): 
+            """Recursive bisection with explicit queue (iterative approach)"""
+
+            queue = [indices if indices is not None else list(range(cov.shape[0]))]
+            
+            while len(queue) > 0:
+                # Take the next cluster from the queue
+                current_cluster = queue.pop(0)
+                if len(current_cluster) <= 1:
+                    continue
+                
+                # Split into two clusters
+                split = len(current_cluster) // 2
+                left_cluster = current_cluster[:split]
+                right_cluster = current_cluster[split:]
+                
+                # Compute variance for each cluster using inverse-variance portfolio
+                var_left = _cluster_var(cov, left_cluster)
+                var_right = _cluster_var(cov, right_cluster)
+                
+                # Allocate weights based on relative variances (avoid division by zero)
+                alpha = 1.0 - (var_left / (var_left + var_right)) if (var_left + var_right) > 1e-8 else 0.5
+                
+                # Scale weights of assets in each cluster
+                weights[left_cluster] *= alpha
+                weights[right_cluster] *= (1.0 - alpha)
+                
+                # Add sub-clusters back to the queue for further splitting
+                queue.append(left_cluster)
+                queue.append(right_cluster)
+                
+            return weights
+    
+        _recursive_bisection(sorted_indices)
+
+        # Final normalization to ensure weights sum to 1  
+        # w        = weights.copy()
+        weights /= weights.sum()
+
+        # Alternative iterative approach (uncomment to use)
+        # weights = _recursive_bisection_alternative(cov, sorted_indices)
+
+        return weights
+    
+    # 2. Risk Parity / Equal Risk Contribution (ERC)
+
+    def risk_parity_optimization(self, method='slsqp', cov=None):
+        """
+        Risk Parity Portfolio with Equal Risk Contribution
+        Each asset contributes equally to the overall portfolio risk.
+
+        Parameter:
+        ----------
+        method : str
+            'slsqp' for SLSQP, 'spinu' for Spinu's method
+        """
+
+        def _risk_parity_optimization(cov=None):
+            """
+            Risk Parity via numerical optimization (SLSQP)
+            """
+            cov = cov if cov is not None else self.cov
+
+            def risk_contributions(weights):
+                """Calculate risk contributions for given weights"""
+                portfolio_var = weights @ cov @ weights
+                if portfolio_var < 1e-10:
+                    return np.ones(self.n_assets) * (1.0 / self.n_assets)
+                
+                marginal_risk = cov @ weights
+                risk_contrib = weights * marginal_risk
+                return risk_contrib / portfolio_var
+            
+            def objective(weights):
+                """Objective function: Minimize deviation of risk contributions"""
+                rc = risk_contributions(weights)
+                target_rc = np.ones(self.n_assets) / self.n_assets
+                return np.sum((rc - target_rc) ** 2)
+            
+            constraints = [
+                {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
+                {'type': 'ineq', 'fun': lambda w: w}  # w >= 0
+            ]
+            
+            # Initial guess: Equal weights
+            w0 = np.ones(self.n_assets) / self.n_assets
+            bounds = [(0, 1) for _ in range(self.n_assets)]
+            
+            result = minimize(objective, w0, method='SLSQP', 
+                            constraints=constraints, bounds=bounds)
+            
+            if result.success:
+                return result.x
+            else:
+                print(f"Risk Parity optimization failed: {result.message}")
+                return w0
+        
+        def _risk_parity_spinu(cov=None):
+            """
+            Risk Parity via Spinu's method (iterative scaling).
+            Fast convergence for large portfolios.
+            """
+            cov = cov if cov is not None else self.cov
+
+            x = cp.Variable(self.n_assets)
+            
+            # Convex objective function
+            objective = cp.Minimize(0.5 * cp.quad_form(x, cov) - cp.sum(cp.log(x)))
+            
+            # Only constraint needed is x > 0
+            constraints = [x >= 1e-5]
+            
+            prob = cp.Problem(objective, constraints)
+            prob.solve()
+
+            if prob.status == 'optimal':
+                # Normalize x to get the actual portfolio weights w
+                weights = x.value / np.sum(x.value)
+                weights[weights < 1e-8] = 0 # Zero out tiny weights
+                weights /= np.sum(weights) # Re-normalize
+
+                return weights
+            else:
+                print(f"CVXPY Risk Parity failed: {prob.status}")
+                return None
+
+        if method == 'spinu':
+            return _risk_parity_spinu(cov=cov)
+        else:
+            return _risk_parity_optimization(cov=cov)
+
+    # 3. Maximum Diversification Portfolio (MDP)
+
+    def maximum_diversification(self, cov=None):
+        """
+        Maximum Diversification Portfolio (Choueifaty & Coignard, 2008).
+
+        Maximises the Diversification Ratio (DR), defined as the ratio of the
+        weighted average of individual asset volatilities to the portfolio volatility.
+        """
+
+        cov = cov if cov is not None else self.cov    
+
+        # Extract volatilities (standard deviations) from the covariance matrix
+        vols = np.sqrt(np.diag(cov))
+
+        w = cp.Variable(self.n_assets)
+        
+        # Target: Minimize portfolio variance (which is equivalent to maximizing diversification ratio)
+        objective = cp.Minimize(cp.quad_form(w, cov))
+        
+        # Constraints: weighted sum of individual volatilities equals 1, and long-only
+        constraints = [
+            vols @ w == 1,  # The weighted sum of individual volatilities equals 1
+            w >= 0          # Long-only constraint
+        ]
+        
+        prob = cp.Problem(objective, constraints)
+        prob.solve()
+
+        w_value = w.value if prob.status == 'optimal' else None
+
+        # def neg_diversification_ratio(w):
+            # Weighted average of individual volatilities
+            # weighted_vols = w.dot(vols)
+            # Portfolio volatility
+            # port_vol = np.sqrt(w @ cov @ w) # or np.sqrt(w.dot(cov.dot(w)))
+            # return -weighted_vols / (port_vol + 1e-10)
+
+        # constraints = [{'type': 'eq', 'fun': lambda w: w.sum() - 1.0}]
+        # bounds      = tuple((0.0, 1.0) for _ in range(self.n_assets))
+        # w0          = np.ones(self.n_assets) / self.n_assets
+
+        # result = minimize(
+            # neg_diversification_ratio, w0,
+            # method='SLSQP', bounds=bounds, constraints=constraints,
+            # options={'ftol': 1e-12, 'maxiter': 1000}
+        # )
+
+        # weights = result.x
+
+        if w_value is not None:
+            # Normalize the solution to get actual portfolio weights
+            weights = w_value / np.sum(w_value)
+            weights[weights < 1e-8] = 0  # zero out tiny weights
+            weights /= np.sum(weights)   # re-normalize
+            return weights
+        else:
+            return None
+
+    # 4. Equal Risk Contribution (ERC) with CVaR
+
+    def cvar_risk_parity_optimization(self, alpha=0.05):
+        """
+        Equal Risk Contribution (ERC) under Conditional Value at Risk.
+
+        Allocates weights so that every asset contributes equally to the portfolio's
+        CVaR (expected shortfall) at level alpha, instead of to its variance as in the
+        classical ERC / risk-parity portfolio. This is risk parity on tail risk.
+
+        Note: assumes the portfolio CVaR is positive (the usual case for loss-bearing
+        return data); if CVaR can turn negative the log-barrier program is unbounded.
+
+        Parameters
+        ----------
+        alpha : float
+            Tail probability for CVaR (e.g. 0.05 for the 95% expected shortfall).
+        """
+
+        w = cp.Variable(self.n_assets)
+        VaR = cp.Variable()
+        loss = cp.Variable(self.n_periods)
+
+        # Rockafellar-Uryasev empirical CVaR of the portfolio loss (-returns @ w)
+        constraints = [
+            w >= 1e-5,  # strictly positive so the log barrier is well defined
+            loss >= -self.returns.values @ w - VaR,
+            loss >= 0
+        ]
+        CVaR = VaR + (1.0 / (alpha * self.n_periods)) * cp.sum(loss)
+
+        # Risk-budgeting objective: equal budgets via the -sum(log w) barrier
+        objective = cp.Minimize(CVaR - cp.sum(cp.log(w)))
+
+        prob = cp.Problem(objective, constraints)
+        prob.solve()
+
+        w_value = w.value if prob.status == 'optimal' else None
+
+        if w_value is not None:
+            # Normalize the risk-budgeting solution to actual portfolio weights
+            weights = w_value / np.sum(w_value)
+            weights[weights < 1e-8] = 0  # zero out tiny weights
+            weights /= np.sum(weights)   # re-normalize
+            return weights
+        else:
+            return None
+
+    # 5. Equal Risk Contribution (ERC) with CDaR
+
+    def cdar_risk_parity_optimization(self, alpha=0.05):
+        """
+        Equal Risk Contribution (ERC) under Conditional Drawdown-at-Risk.
+
+        Allocates weights so that every asset contributes equally to the portfolio's
+        CDaR (expected tail drawdown) at level alpha, instead of to its variance as in the
+        classical ERC / risk-parity portfolio. This is risk parity on tail risk.
+
+        Note: assumes the portfolio CDaR is positive (the usual case for loss-bearing
+        return data); if it can turn negative the log-barrier program is unbounded.
+
+        Parameters
+        ----------
+        alpha : float
+            Tail probability for the drawdown (e.g. 0.05 -> average of the worst 5% drawdowns)
+        """
+        T = self.n_periods
+
+        # Uncompounded cumulative return path is affine in w (see cdar_optimization)
+        cum_returns = np.tril(np.ones((T, T))) @ self.returns.values  # (T, N)
+
+        w = cp.Variable(self.n_assets)
+        u = cp.Variable(T)    # running peak (high-water mark) of the cumulative path
+        z = cp.Variable(T)    # drawdown exceedances over the threshold zeta
+        zeta = cp.Variable()  # Drawdown-at-Risk threshold (DaR)
+
+        cumulative = cum_returns @ w
+
+        constraints = [
+            w >= 1e-5,                  # strictly positive so the log barrier is well defined
+            u >= cumulative,            # peak is at least the current cumulative value
+            u[1:] >= u[:-1],            # peak is non-decreasing (running maximum)
+            u >= 0,                     # peak measured from initial capital (drawdown from 0)
+            z >= u - cumulative - zeta, # exceedance of drawdown D_t = u - cumulative over zeta
+            z >= 0
+        ]
+
+        # Rockafellar-Uryasev representation of CDaR: minimize over zeta the sum of zeta and the average exceedance
+        CDaR = zeta + (1.0 / (alpha * T)) * cp.sum(z)
+
+        # Risk-budgeting objective: equal budgets via the -sum(log w) barrier
+        objective = cp.Minimize(CDaR - cp.sum(cp.log(w)))
+
+        prob = cp.Problem(objective, constraints)
+        prob.solve()
+
+        w_value = w.value if prob.status == 'optimal' else None
+
+        if w_value is not None:
+            # Normalize the risk-budgeting solution to actual portfolio weights
+            weights = w_value / np.sum(w_value)
+            weights[weights < 1e-8] = 0  # zero out tiny weights
+            weights /= np.sum(weights)   # re-normalize
+            return weights
+        else:
+            return None
+        
+    # ========================================================================
+    # 9. GROWTH-OPTIMAL (KELLY) PORTFOLIOS
+    # ========================================================================
+
+    def kelly_optimization(self, fraction=1.0, return_scale=1.0, baseline=None):
+        """
+        Kelly / growth-optimal portfolio (log-utility), with optional fractional Kelly.
+
+        Maximises the expected log-growth rate of wealth (the geometric growth rate),
+        estimated empirically over the sample. The full Kelly bet maximises long-run growth, 
+        but is aggressive and very sensitive to estimation error (it overbets when mu is overestimated).
+
+        Fractional Kelly (fraction < 1) addresses this by blending the Kelly weights with a
+        conservative anchor. Since the assumption is a fully-invested and long-only portfolio, 
+        we blend toward a low-risk anchor (minimum-variance by default):
+            w = fraction * w_kelly + (1 - fraction) * w_anchor
+
+        Note: requires 1 + (R_t * w) / return_scale > 0 for all t (true for diversified
+        long-only equity returns). Otherwise the log is undefined and the solve fails.
+
+        Parameters
+        ----------
+        fraction : float
+            Kelly fraction in (0, 1]. 1.0 = full Kelly; 0.5 = half Kelly.
+        return_scale : float
+            Divisor converting the stored returns to decimals before forming gross
+            returns 1 + r. Use 1.0 for decimal returns, 100.0 if returns are in percent.
+        baseline : np.ndarray, optional
+            Conservative anchor weights for fractional Kelly (defaults to minimum variance).
+        """
+        R = self.returns.values / return_scale
+
+        w = cp.Variable(self.n_assets)
+
+        growth = cp.sum(cp.log(1 + R @ w)) / self.n_periods
+        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+
+        prob = cp.Problem(cp.Maximize(growth), constraints)
+        prob.solve()
+
+        w_kelly = w.value if prob.status == 'optimal' else None
+
+        if fraction >= 1.0:
+            return w_kelly
+
+        # Fractional Kelly: blend toward a conservative anchor
+        w_anchor = baseline if baseline is not None else self.min_variance()
+        if w_anchor is None:
+            return w_kelly
+        
+        weights = fraction * w_kelly + (1.0 - fraction) * w_anchor
+        weights = np.clip(weights, 0, None)
+        weights /= np.sum(weights)
+
+        return weights
+
+    def worst_case_kelly_optimization(self, alpha=0.1, return_scale=1.0):
+        """
+        Worst-Case (distributionally robust) Kelly portfolio (Sun & Boyd, 2018).
+
+        Instead of the average log-growth, maximises the worst-case average log-growth over the 
+        fraction alpha of least favourable periods, the lower-tail CVaR of the per-period log-growth. 
+        As alpha -> 1 it recovers full Kelly, smaller alpha is more conservative.
+
+        Parameters
+        ----------
+        alpha : float
+            Tail fraction of worst-growth periods to protect (e.g. 0.1 -> worst 10%).
+        return_scale : float
+            Divisor converting stored returns to decimals (1.0 decimal, 100.0 percent).
+        """
+        T = self.n_periods
+        R = self.returns.values / return_scale
+
+        w = cp.Variable(self.n_assets)
+        eta = cp.Variable()
+
+        g = cp.log(1 + R @ w)  # per-period log-growth (concave in w)
+        # Lower-tail CVaR of the log-growth = average growth in the worst alpha-fraction
+        lower_tail_growth = eta - (1.0 / (alpha * T)) * cp.sum(cp.pos(eta - g))
+
+        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+        prob = cp.Problem(cp.Maximize(lower_tail_growth), constraints)
+        prob.solve()
+
+        weights = w.value if prob.status == 'optimal' else None
+
+        return weights
+
+    # ========================================================================
+    # 10. BENCHMARKS
+    # ========================================================================
+
+    # 1. 1/N Equal Weight Portfolio
+
+    def equal_weight_portfolio(self):
+        """
+        Naive 1/N diversification (Equal Weight Portfolio)
+        """
+        n = self.n_assets
+        weights = np.ones(n) / n
         
         return weights
     

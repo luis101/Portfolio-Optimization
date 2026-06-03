@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
     for method, stats in results.items():
         print(f"\n{method}:")
-        print(f"  Sharpe Ratio:            {stats['sharpe_ratio'] * np.sqrt(12):.4f}")
+        print(f"  Sharpe Ratio (annual):    {stats['sharpe_ratio']:.4f}")
         print(f"  Expected Return (annual): {stats['expected_return']:.4f}")
         print(f"  Volatility (annual):      {stats['volatility']:.4f}")
         # print("  Weights:")
