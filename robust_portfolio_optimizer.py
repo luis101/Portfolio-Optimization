@@ -2,35 +2,18 @@
 
 ###### Robust Portfolio Optimization Suite ##########################################
 
-# Not included is a rolling backtest framework, which is critical for evaluating out-of-sample performance.
-# Fix an estimation window (e.g. 60 months)
-# Estimate weights on that window, hold for 1 period
-# Slide forward, repeat
-# Compute realized statistics on the held-out returns
-# Key out-of-sample metrics to compare:
-# Realized annualized Sharpe, Realized vs. predicted volatility ratio, Maximum drawdown, Portfolio turnover 
-# Effective N (1 / Σwᵢ²), statistical significance of Sharpe differences between methods
-
-# Potential additions:
-# 1/N equal weight. 
-# Risk Parity / Equal Risk Contribution (ERC). Allocates weights such that each asset contributes equally to total portfolio variance (wᵢ · (Σw)ᵢ = constant).
-# Hierarchical Risk Parity (HRP) (López de Prado, 2016). Uses hierarchical clustering on the correlation matrix to build a tree, 
-# then allocates risk top-down along the tree. Requires no matrix inversion, so it is robust to near-singular covariances.
-# Minimum Covariance Determinant (MCD) robust covariance. Your Ledoit-Wolf shrinkage handles estimation noise but not outliers. 
-# MCD fits the covariance on the subset of observations with the smallest determinant, making it resistant to return outliers (crises, flash crashes).
-# Transaction-cost-aware objective. Adding a turnover penalty κ · ‖w_t − w_{t-1}‖₁ to the CVXPY objective is a one-line change but makes the comparison realistic.
+# This module implements a comprehensive suite of portfolio optimization methods.
 
 
 import numpy as np
 import pandas as pd
 import cvxpy as cp
 from scipy.optimize import minimize
-from scipy.stats import norm
 from scipy.spatial.distance import squareform
+# from scipy.stats import norm
 import scipy.cluster.hierarchy as sch
 from sklearn.covariance import MinCovDet
 from sklearn.linear_model import LinearRegression
-import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -53,7 +36,9 @@ class PortfolioOptimizer:
     12. Equal weight portfolio (naive diversification)
     """
     
-    def __init__(self, returns_data, risk_free_rate=0.0, periods_per_year=12):
+    def __init__(self, returns_data, risk_free_rate=0.0, periods_per_year=12,
+                 weight_bounds=(0.0, 1.0), leverage=1.0, max_position=None,
+                 transaction_cost=None):
         """
         Initialize the optimizer with historical returns data
 
@@ -66,6 +51,15 @@ class PortfolioOptimizer:
         periods_per_year : int
             Number of return periods per year, used to annualize reported
             statistics (12 for monthly, 252 for daily, etc.)
+        weight_bounds : tuple (lower, upper)
+            Per-asset weight bounds shared by the optimizers. (0.0, 1.0) is long-only with no leverage,
+            use (-1.0, 1.0) or (None, None) to allow shorting. None on a side means unbounded.
+        leverage : float
+            Target gross investment, i.e. the value of sum(w) = 1.0 = fully invested, 0.0 is dollar-neutral.
+        max_position : float, optional
+            If set, an extra cap |w_i| <= max_position on every asset.
+        transaction_cost : float
+            Turnover-penalty coefficient kappa. The cost term is kappa * sum(|w_t - w_{t-1}|).
         """
 
         if isinstance(returns_data, pd.DataFrame):
@@ -81,7 +75,12 @@ class PortfolioOptimizer:
         self.n_periods = self.returns.shape[0]
         self.rf = risk_free_rate
         self.ppy = periods_per_year
-        
+        self.weight_bounds = weight_bounds
+        self.leverage = leverage
+        self.max_position = max_position
+        self.transaction_cost = transaction_cost
+        self.prev_weights = None  # a weight vector (or None) set per rebalance for the turnover penalty
+
         # Calculate basic statistics (kept as plain ndarrays for uniform use downstream)
         self.mu = np.asarray(np.mean(self.returns, axis=0))
         self.cov = np.asarray(np.cov(self.returns.T))
@@ -118,15 +117,32 @@ class PortfolioOptimizer:
         sharpe = (ret - self.rf) / vol
         return -sharpe
     
+    def _base_constraints(self, w):
+        """Shared constraints for the convex optimizers. Methods append their own
+        (e.g. a target-return or loss constraint) constraints on top of these."""
+        lower, upper = self.weight_bounds
+        constraints = [cp.sum(w) == self.leverage]
+        if lower is not None: constraints.append(w >= lower)
+        if upper is not None: constraints.append(w <= upper)
+        if self.max_position is not None:
+            constraints += [w <= self.max_position, w >= -self.max_position]
+        return constraints
+
+    def _turnover_penalty(self, w):
+        """Transaction-cost term added to the convex objectives."""
+        if self.transaction_cost and self.prev_weights is not None:
+            return self.transaction_cost * cp.norm1(w - self.prev_weights)
+        return 0.0
+    
     def _solve_mean_variance_sample(self, mu, cov, target_return, risk_aversion=1.0):
         """Helper function for mean-variance optimization"""
         w = cp.Variable(self.n_assets)
         if target_return is not None:
-            constraints = [cp.sum(w) == 1, w >= 0, w <= 1, w.T @ mu >= target_return]
-            objective = cp.Minimize(cp.quad_form(w, cov))
+            constraints = self._base_constraints(w) + [w.T @ mu >= target_return]
+            objective = cp.Minimize(cp.quad_form(w, cov) + self._turnover_penalty(w))
         else:
-            constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-            objective = cp.Minimize(-w.T @ mu + risk_aversion * cp.quad_form(w, cov))
+            constraints = self._base_constraints(w)
+            objective = cp.Minimize(-w.T @ mu + risk_aversion * cp.quad_form(w, cov) + self._turnover_penalty(w))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -136,13 +152,26 @@ class PortfolioOptimizer:
     def _solve_min_variance_sample(self, cov):
         """Helper function for minimum variance optimization"""
         w = cp.Variable(self.n_assets)
-        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-        objective = cp.Minimize(cp.quad_form(w, cov))
-        
+        constraints = self._base_constraints(w)
+        objective = cp.Minimize(cp.quad_form(w, cov) + self._turnover_penalty(w))
+
         prob = cp.Problem(objective, constraints)
         prob.solve()
-        
+
         return w.value if prob.status == 'optimal' else None
+
+    def _solve_log_growth(self, prob):
+        """Solve a log-growth problem, falling back to SCS when the default solver (CLARABEL) fails to converge."""
+        try:
+            prob.solve()
+        except cp.error.SolverError:
+            pass
+        if prob.status not in ('optimal', 'optimal_inaccurate'):
+            try:
+                prob.solve(solver=cp.SCS)
+            except cp.error.SolverError:
+                pass
+        return prob.status
     
     # ========================================================================
     # 1. CLASSICAL MARKOWITZ OPTIMIZATION
@@ -176,20 +205,11 @@ class PortfolioOptimizer:
         w = cp.Variable(self.n_assets)
         
         if target_return is not None:
-            constraints = [
-                cp.sum(w) == 1,
-                w >= 0,
-                w <= 1,
-                w.T @ self.mu >= target_return
-            ]
-            objective = cp.Minimize(cp.quad_form(w, self.cov))
+            constraints = self._base_constraints(w) + [w.T @ self.mu >= target_return]
+            objective = cp.Minimize(cp.quad_form(w, self.cov) + self._turnover_penalty(w))
         else:
-            constraints = [
-                cp.sum(w) == 1,
-                w >= 0,
-                w <= 1
-            ]
-            objective = cp.Minimize(-w.T @ self.mu + risk_aversion * cp.quad_form(w, self.cov))
+            constraints = self._base_constraints(w)
+            objective = cp.Minimize(-w.T @ self.mu + risk_aversion * cp.quad_form(w, self.cov) + self._turnover_penalty(w))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -206,8 +226,8 @@ class PortfolioOptimizer:
         """Minimum Variance Portfolio"""
         w = cp.Variable(self.n_assets)
 
-        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-        objective = cp.Minimize(cp.quad_form(w, self.cov))
+        constraints = self._base_constraints(w)
+        objective = cp.Minimize(cp.quad_form(w, self.cov) + self._turnover_penalty(w))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -270,8 +290,8 @@ class PortfolioOptimizer:
         robust_return = portfolio_returns - sqrt_eps * weight_penalty   # robust mean
 
         # Mean - risk_aversion * (robust variance), with robust variance = sigma_wc^2
-        objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * cp.square(worst_case_variance))
-        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+        objective = cp.Minimize(-(robust_return - self.rf) + risk_aversion * cp.square(worst_case_variance) + self._turnover_penalty(w))
+        constraints = self._base_constraints(w)
 
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -362,11 +382,11 @@ class PortfolioOptimizer:
         # worst_case_variance = cp.quad_form(w, cov_robust)
         worst_case_variance = cp.quad_form(w, self.cov) + sigma_uncertainty
 
-        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+        constraints = self._base_constraints(w)
 
         # Objective: maximize worst-case return - risk_aversion * worst-case variance
         # objective = cp.Maximize(worst_case_return - risk_aversion * worst_case_variance)
-        objective = cp.Minimize(-worst_case_return + risk_aversion * worst_case_variance)
+        objective = cp.Minimize(-worst_case_return + risk_aversion * worst_case_variance + self._turnover_penalty(w))
 
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -522,8 +542,8 @@ class PortfolioOptimizer:
                     # result = minimize(self._neg_sharpe, init_weights, args=(mu_sample, cov_sample, self.rf),
                     #                   method='SLSQP', bounds=bounds, constraints=constraints)
                     w = cp.Variable(self.n_assets)
-                    constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-                    objective = cp.Minimize(-w.T @ mu_sample + risk_aversion * cp.quad_form(w, cov_sample))
+                    constraints = self._base_constraints(w)
+                    objective = cp.Minimize(-w.T @ mu_sample + risk_aversion * cp.quad_form(w, cov_sample) + self._turnover_penalty(w))
                     # objective = cp.Minimize(cp.quad_form(w, cov_sample))
         
                     prob = cp.Problem(objective, constraints)
@@ -532,8 +552,8 @@ class PortfolioOptimizer:
                     # result = minimize(lambda w: np.dot(w, np.dot(cov_sample, w)), init_weights,
                     #                   method='SLSQP', bounds=bounds, constraints=constraints)
                     w = cp.Variable(self.n_assets)
-                    constraints = [cp.sum(w) == 1, w >= 0, w <= 1, w.T @ mu_sample >= target_return]
-                    objective = cp.Minimize(cp.quad_form(w, cov_sample))
+                    constraints = self._base_constraints(w) + [w.T @ mu_sample >= target_return]
+                    objective = cp.Minimize(cp.quad_form(w, cov_sample) + self._turnover_penalty(w))
         
                     prob = cp.Problem(objective, constraints)
                     prob.solve()
@@ -799,8 +819,7 @@ class PortfolioOptimizer:
         VaR = cp.Variable()
         loss = cp.Variable(self.n_periods)
         
-        constraints = [
-            cp.sum(w) == 1, w >= 0, w <= 1,
+        constraints = self._base_constraints(w) + [
             loss >= -self.returns.values @ w - VaR,
             loss >= 0
         ]
@@ -808,7 +827,7 @@ class PortfolioOptimizer:
         CVaR = VaR + (1/(alpha * self.n_periods)) * cp.sum(loss)
         expected_return = self.mu @ w
 
-        objective = cp.Minimize(-expected_return + risk_aversion * CVaR)
+        objective = cp.Minimize(-expected_return + risk_aversion * CVaR + self._turnover_penalty(w))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -832,8 +851,7 @@ class PortfolioOptimizer:
         loss = cp.Variable(self.n_periods)
         
         # CVaR constraints
-        constraints = [
-            cp.sum(w) == 1, w >= 0, w <= 1,
+        constraints = self._base_constraints(w) + [
             loss >= -self.returns.values @ w - VaR,
             loss >= 0
         ]
@@ -846,7 +864,7 @@ class PortfolioOptimizer:
         robust_CVaR = CVaR + robustness_margin
         expected_return = self.mu @ w - epsilon * cp.norm(w, 2)  # Worst-case mean (same margin)
         
-        objective = cp.Minimize(-expected_return + risk_aversion * robust_CVaR)
+        objective = cp.Minimize(-expected_return + risk_aversion * robust_CVaR + self._turnover_penalty(w))
         
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -886,8 +904,7 @@ class PortfolioOptimizer:
 
         cumulative = cum_returns @ w  # cumulative return at each t (affine in w)
 
-        constraints = [
-            cp.sum(w) == 1, w >= 0, w <= 1,
+        constraints = self._base_constraints(w) + [
             u >= cumulative,            # peak is at least the current cumulative value
             u[1:] >= u[:-1],            # peak is non-decreasing (running maximum)
             u >= 0,                     # peak measured from initial capital (drawdown from 0)
@@ -899,7 +916,7 @@ class PortfolioOptimizer:
         CDaR = zeta + (1.0 / (alpha * T)) * cp.sum(z)
         expected_return = self.mu @ w
 
-        objective = cp.Minimize(-expected_return + risk_aversion * CDaR)
+        objective = cp.Minimize(-expected_return + risk_aversion * CDaR + self._turnover_penalty(w))
 
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -949,8 +966,8 @@ class PortfolioOptimizer:
 
         utility_penalized = -utility  + l1_penalty + l2_penalty
 
-        objective = cp.Minimize(utility_penalized)
-        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+        objective = cp.Minimize(utility_penalized + self._turnover_penalty(w))
+        constraints = self._base_constraints(w)
 
         prob = cp.Problem(objective, constraints)
         prob.solve()
@@ -1410,12 +1427,13 @@ class PortfolioOptimizer:
         w = cp.Variable(self.n_assets)
 
         growth = cp.sum(cp.log(1 + R @ w)) / self.n_periods
-        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+        # constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+        constraints = self._base_constraints(w)
 
         prob = cp.Problem(cp.Maximize(growth), constraints)
-        prob.solve()
+        status = self._solve_log_growth(prob)
 
-        w_kelly = w.value if prob.status == 'optimal' else None
+        w_kelly = w.value if status in ('optimal', 'optimal_inaccurate') else None
 
         if fraction >= 1.0:
             return w_kelly
@@ -1456,11 +1474,13 @@ class PortfolioOptimizer:
         # Lower-tail CVaR of the log-growth = average growth in the worst alpha-fraction
         lower_tail_growth = eta - (1.0 / (alpha * T)) * cp.sum(cp.pos(eta - g))
 
-        constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
-        prob = cp.Problem(cp.Maximize(lower_tail_growth), constraints)
-        prob.solve()
+        # constraints = [cp.sum(w) == 1, w >= 0, w <= 1]
+        constraints = self._base_constraints(w)
 
-        weights = w.value if prob.status == 'optimal' else None
+        prob = cp.Problem(cp.Maximize(lower_tail_growth), constraints)
+        status = self._solve_log_growth(prob)
+
+        weights = w.value if status in ('optimal', 'optimal_inaccurate') else None
 
         return weights
 
